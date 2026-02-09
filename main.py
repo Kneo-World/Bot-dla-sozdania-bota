@@ -1,14 +1,14 @@
 import os
 import json
 import logging
+import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message, CallbackQuery, 
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    WebAppInfo
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -48,7 +48,6 @@ dp.include_router(router)
 class BotConstructorStates(StatesGroup):
     waiting_for_token = State()
     waiting_for_greeting = State()
-    waiting_for_buttons = State()
     waiting_button_text = State()
     waiting_button_url = State()
 
@@ -146,6 +145,13 @@ async def check_bot_token(token: str) -> tuple[bool, Optional[str]]:
         logger.error(f"Ошибка проверки токена: {e}")
         return False, None
 
+def create_user_bot_instance(token: str) -> Bot:
+    """Создание экземпляра бота пользователя"""
+    return Bot(
+        token=token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
     """Главное меню управления ботом"""
@@ -218,7 +224,7 @@ def get_buttons_management_keyboard():
 
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
     """Обработчик команды /start"""
     user_id = message.from_user.id
     await save_user(user_id)
@@ -240,8 +246,6 @@ async def cmd_start(message: Message):
             "<i>Отправьте токен бота, полученный от @BotFather:</i>"
         )
         # Устанавливаем состояние ожидания токена
-        from aiogram.fsm.context import FSMContext
-        state = FSMContext(storage=dp.storage, key=chat=message.chat.id, user=user_id)
         await state.set_state(BotConstructorStates.waiting_for_token)
 
 @router.message(Command("help"))
@@ -545,19 +549,19 @@ async def cancel_callback(callback: CallbackQuery, state: FSMContext):
             "❌ Действие отменено.\n\n"
             "Отправьте токен бота для начала работы:"
         )
-        await state.set_state(BotConstructorStates.waiting_for_token)
     
     await callback.answer()
 
 # ========== ВЕБ-СЕРВЕР ДЛЯ RENDER ==========
+async def health_check(request):
+    """Проверка здоровья сервиса"""
+    return web.Response(text="Bot constructor is running!")
+
 async def web_server():
     """Запуск веб-сервера для поддержания активности на Render"""
     app = web.Application()
     
     # Простой эндпоинт для проверки здоровья
-    async def health_check(request):
-        return web.Response(text="Bot constructor is running!")
-    
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
     
@@ -568,6 +572,9 @@ async def web_server():
     logger.info(f"Web server started on port {PORT}")
     await site.start()
 
+    # Запускаем сервер на неопределенное время
+    await asyncio.Event().wait()
+
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 async def main():
     """Основная функция запуска бота"""
@@ -576,14 +583,22 @@ async def main():
     # Инициализация базы данных
     await init_db()
     
-    # Запуск веб-сервера в фоне
-    import asyncio
-    asyncio.create_task(web_server())
+    # Запуск веб-сервера в отдельной задаче
+    web_server_task = asyncio.create_task(web_server())
     
-    # Запуск бота
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        # Запуск бота
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Ошибка при запуске бота: {e}")
+    finally:
+        # Отмена задачи веб-сервера при завершении
+        web_server_task.cancel()
+        try:
+            await web_server_task
+        except asyncio.CancelledError:
+            pass
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
