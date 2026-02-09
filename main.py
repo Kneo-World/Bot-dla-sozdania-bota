@@ -7,16 +7,31 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiohttp import web
 from dotenv import load_dotenv
 
+# Настройки
 load_dotenv()
 API_TOKEN = os.getenv('BOT_TOKEN')
+PORT = int(os.environ.get("PORT", 8080)) # Порт для Render
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# Состояния для редактора
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def start_server():
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+
+# --- ЛОГИКА КОНСТРУКТОРА ---
 class BotEditor(StatesGroup):
     waiting_for_text = State()
     waiting_for_button_text = State()
@@ -24,59 +39,54 @@ class BotEditor(StatesGroup):
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="✨ Создать пост с кнопкой", callback_data="create_post"))
+    
     await message.answer(
-        "🛠 **Конструктор ботов**\n\nНажми кнопку ниже, чтобы создать новое сообщение с кнопкой.",
-        reply_markup=InlineKeyboardBuilder().button(
-            text="Создать пост", callback_data="create_post"
-        ).as_markup()
+        "👋 Привет! Я конструктор ботов.\n\n"
+        "Я помогу тебе создать сообщение с красивой инлайн-кнопкой.",
+        reply_markup=builder.as_markup()
     )
 
-# Начало создания поста
 @dp.callback_query(F.data == "create_post")
 async def start_creation(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите текст вашего будущего сообщения:")
+    await callback.message.answer("1️⃣ Введите текст сообщения:")
     await state.set_state(BotEditor.waiting_for_text)
     await callback.answer()
 
-# Получаем текст сообщения
 @dp.message(BotEditor.waiting_for_text)
 async def get_text(message: Message, state: FSMContext):
     await state.update_data(post_text=message.text)
-    await message.answer("Отлично! Теперь введите текст для инлайн-кнопки:")
+    await message.answer("2️⃣ Теперь введите текст, который будет на кнопке:")
     await state.set_state(BotEditor.waiting_for_button_text)
 
-# Получаем текст кнопки
 @dp.message(BotEditor.waiting_for_button_text)
 async def get_btn_text(message: Message, state: FSMContext):
     await state.update_data(btn_text=message.text)
-    await message.answer("И последним шагом — пришлите ссылку (URL) для этой кнопки:")
+    await message.answer("3️⃣ Пришлите ссылку (URL) для кнопки (например, https://google.com):")
     await state.set_state(BotEditor.waiting_for_button_url)
 
-# Финальный результат
 @dp.message(BotEditor.waiting_for_button_url)
 async def get_btn_url(message: Message, state: FSMContext):
     if not message.text.startswith("http"):
-        await message.answer("Ошибка! Ссылка должна начинаться с http:// или https://")
+        await message.answer("⚠️ Ошибка! Ссылка должна начинаться с http:// или https://")
         return
 
-    user_data = await state.get_data()
-    
-    # Сборка клавиатуры
+    data = await state.get_data()
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(
-        text=user_data['btn_text'], 
-        url=message.text)
-    )
+    builder.row(InlineKeyboardButton(text=data['btn_text'], url=message.text))
 
-    await message.answer("✅ Ваш пост готов:")
-    await message.answer(
-        text=user_data['post_text'],
-        reply_markup=builder.as_markup()
-    )
+    await message.answer("✅ Готово! Вот ваш результат:")
+    await message.answer(text=data['post_text'], reply_markup=builder.as_markup())
     await state.clear()
 
+# --- ЗАПУСК ---
 async def main():
-    await dp.start_polling(bot)
+    # Запускаем сервер и бота одновременно
+    await asyncio.gather(
+        start_server(),
+        dp.start_polling(bot)
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
