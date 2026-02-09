@@ -2,21 +2,21 @@ import os
 import json
 import logging
 import asyncio
+import re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Set, Any
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message, CallbackQuery, 
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    PhotoSize, Video
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ContentType
+from aiogram.enums import ParseMode
 
 import aiosqlite
 import aiohttp
@@ -38,7 +38,8 @@ PORT = int(os.getenv('PORT', 10000))
 
 # ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
 user_bots: Dict[str, Tuple[Bot, Dispatcher, asyncio.Task]] = {}  # token -> (Bot, Dispatcher, Task)
-WATERMARK = "⚒️ Бот создан с помощью @KneoFreeBot\n\n"
+WATERMARK_MESSAGE = "⚒️ Бот создан с помощью @KneoFreeBot"
+WATERMARK_IN_TEXT = "⚒️ Бот создан с помощью @KneoFreeBot\n\n"
 
 # ========== ОСНОВНОЙ БОТ И ДИСПЕТЧЕР ==========
 main_bot = Bot(
@@ -53,18 +54,16 @@ main_dp.include_router(main_router)
 class BotConstructorStates(StatesGroup):
     waiting_for_token = State()
     waiting_scene_name = State()
-    waiting_content_type = State()
-    waiting_scene_text = State()
-    waiting_scene_photo = State()
-    waiting_scene_video = State()
-    waiting_scene_caption = State()
+    waiting_scene_message = State()
+    waiting_more_messages = State()
     waiting_button_type = State()
     waiting_button_text = State()
     waiting_button_url = State()
     waiting_button_target_scene = State()
+    waiting_variable_action = State()
+    waiting_variable_value = State()
     editing_scene = State()
-    waiting_edit_content = State()
-    waiting_edit_caption = State()
+    waiting_new_message = State()
 
 # ========== БАЗА ДАННЫХ ==========
 async def init_db():
@@ -92,18 +91,30 @@ async def init_db():
             )
         ''')
         
-        # Таблица для сцен с поддержкой медиа
+        # Таблица для сцен
         await db.execute('''
             CREATE TABLE IF NOT EXISTS scenes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bot_id INTEGER,
                 name TEXT,
-                content_type TEXT DEFAULT 'text',  -- text, photo, video
-                file_id TEXT,  -- file_id для медиа
-                caption TEXT,  -- подпись для медиа
-                buttons_json TEXT DEFAULT '[]',
+                messages_json TEXT DEFAULT '[]',  -- JSON список сообщений
+                buttons_json TEXT DEFAULT '[]',   -- Кнопки для последнего сообщения
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(bot_id, name),
+                FOREIGN KEY (bot_id) REFERENCES user_bots (id)
+            )
+        ''')
+        
+        # Таблица для переменных пользователей
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS user_vars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id INTEGER,
+                user_id INTEGER,
+                var_name TEXT DEFAULT 'stars',
+                var_value INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(bot_id, user_id, var_name),
                 FOREIGN KEY (bot_id) REFERENCES user_bots (id)
             )
         ''')
@@ -177,30 +188,25 @@ async def get_scene(bot_id: int, scene_name: str) -> Optional[Dict]:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-async def save_scene(bot_id: int, scene_name: str, content_type: str, file_id: str = None, caption: str = None):
+async def save_scene(bot_id: int, scene_name: str, messages: List[str], buttons: List[Dict] = None):
     """Сохранение сцены"""
+    messages_json = json.dumps(messages, ensure_ascii=False)
+    buttons_json = json.dumps(buttons if buttons else [], ensure_ascii=False)
+    
     async with aiosqlite.connect('database.db') as db:
         await db.execute('''
-            INSERT OR REPLACE INTO scenes (bot_id, name, content_type, file_id, caption)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (bot_id, scene_name, content_type, file_id, caption))
+            INSERT OR REPLACE INTO scenes (bot_id, name, messages_json, buttons_json)
+            VALUES (?, ?, ?, ?)
+        ''', (bot_id, scene_name, messages_json, buttons_json))
         await db.commit()
 
-async def update_scene_content(bot_id: int, scene_name: str, content_type: str = None, file_id: str = None, caption: str = None):
-    """Обновление контента сцены"""
+async def update_scene_messages(bot_id: int, scene_name: str, messages: List[str]):
+    """Обновление сообщений сцены"""
+    messages_json = json.dumps(messages, ensure_ascii=False)
     async with aiosqlite.connect('database.db') as db:
-        if content_type:
-            await db.execute('''
-                UPDATE scenes SET content_type = ? WHERE bot_id = ? AND name = ?
-            ''', (content_type, bot_id, scene_name))
-        if file_id:
-            await db.execute('''
-                UPDATE scenes SET file_id = ? WHERE bot_id = ? AND name = ?
-            ''', (file_id, bot_id, scene_name))
-        if caption is not None:
-            await db.execute('''
-                UPDATE scenes SET caption = ? WHERE bot_id = ? AND name = ?
-            ''', (caption, bot_id, scene_name))
+        await db.execute('''
+            UPDATE scenes SET messages_json = ? WHERE bot_id = ? AND name = ?
+        ''', (messages_json, bot_id, scene_name))
         await db.commit()
 
 async def update_scene_buttons(bot_id: int, scene_name: str, buttons: List[Dict]):
@@ -249,6 +255,58 @@ async def check_bot_token(token: str) -> Tuple[bool, Optional[str]]:
         logger.error(f"Ошибка проверки токена: {e}")
         return False, None
 
+async def get_user_variable(bot_id: int, user_id: int, var_name: str = "stars") -> int:
+    """Получение значения переменной пользователя"""
+    async with aiosqlite.connect('database.db') as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT var_value FROM user_vars 
+            WHERE bot_id = ? AND user_id = ? AND var_name = ?
+        ''', (bot_id, user_id, var_name))
+        row = await cursor.fetchone()
+        if row:
+            return row['var_value']
+        else:
+            # Если записи нет, создаем со значением по умолчанию 0
+            await db.execute('''
+                INSERT INTO user_vars (bot_id, user_id, var_name, var_value)
+                VALUES (?, ?, ?, ?)
+            ''', (bot_id, user_id, var_name, 0))
+            await db.commit()
+            return 0
+
+async def update_user_variable(bot_id: int, user_id: int, var_name: str, new_value: int):
+    """Обновление значения переменной пользователя"""
+    async with aiosqlite.connect('database.db') as db:
+        await db.execute('''
+            INSERT OR REPLACE INTO user_vars (bot_id, user_id, var_name, var_value)
+            VALUES (?, ?, ?, ?)
+        ''', (bot_id, user_id, var_name, new_value))
+        await db.commit()
+
+# ========== ФУНКЦИИ ДЛЯ РАБОТЫ С ПЛЕЙСХОЛДЕРАМИ ==========
+def parse_placeholders(text: str, user_data: Dict, stars_value: int = 0) -> str:
+    """
+    Замена плейсхолдеров в тексте на реальные значения
+    user_data должен содержать: id, first_name, username
+    """
+    replacements = {
+        '##stars##': str(stars_value),
+        '##name_user##': user_data.get('first_name', 'Пользователь'),
+        '##ID_user##': str(user_data.get('id', '')),
+        '##user_user##': f"@{user_data.get('username', '')}" if user_data.get('username') else user_data.get('first_name', 'Пользователь')
+    }
+    
+    result = text
+    for placeholder, value in replacements.items():
+        result = result.replace(placeholder, value)
+    
+    # Добавляем вотермарку в начало текста
+    if not result.startswith(WATERMARK_IN_TEXT.strip()):
+        result = WATERMARK_IN_TEXT + result
+    
+    return result
+
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
     """Главное меню управления ботом"""
@@ -264,6 +322,9 @@ def get_main_keyboard():
             ],
             [
                 InlineKeyboardButton(text="📊 Статус", callback_data="bot_status"),
+                InlineKeyboardButton(text="❓ Помощь", callback_data="help")
+            ],
+            [
                 InlineKeyboardButton(text="🔄 Сменить токен", callback_data="change_token")
             ]
         ]
@@ -280,17 +341,15 @@ def get_cancel_keyboard():
     )
 
 def get_content_type_keyboard():
-    """Клавиатура выбора типа контента"""
+    """Клавиатура выбора типа контента (только текст)"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="📝 Текст", callback_data="content_text")
             ],
             [
-                InlineKeyboardButton(text="🖼️ Фото", callback_data="content_photo")
-            ],
-            [
-                InlineKeyboardButton(text="🎥 Видео", callback_data="content_video")
+                InlineKeyboardButton(text="🖼️ Фото", callback_data="content_photo_disabled"),
+                InlineKeyboardButton(text="🎥 Видео", callback_data="content_video_disabled")
             ],
             [
                 InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
@@ -305,7 +364,7 @@ def get_scene_management_keyboard(scene_name: str = None):
             InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="add_button_to_scene")
         ],
         [
-            InlineKeyboardButton(text="✏️ Редактировать контент", callback_data=f"edit_scene_{scene_name}" if scene_name else "edit_scene")
+            InlineKeyboardButton(text="➕ Добавить сообщение", callback_data="add_message_to_scene")
         ],
         [
             InlineKeyboardButton(text="✅ Завершить сцену", callback_data="finish_scene")
@@ -330,6 +389,26 @@ def get_button_type_keyboard():
                 InlineKeyboardButton(text="🔄 Переход на сцену", callback_data="button_type_scene")
             ],
             [
+                InlineKeyboardButton(text="⭐ Изменить переменную", callback_data="button_type_variable")
+            ],
+            [
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
+            ]
+        ]
+    )
+
+def get_variable_action_keyboard():
+    """Клавиатура выбора действия с переменной"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Увеличить на 1", callback_data="var_action_plus_1"),
+                InlineKeyboardButton(text="➖ Уменьшить на 1", callback_data="var_action_minus_1")
+            ],
+            [
+                InlineKeyboardButton(text="✏️ Ввести значение", callback_data="var_action_set")
+            ],
+            [
                 InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
             ]
         ]
@@ -342,15 +421,11 @@ def get_scenes_list_keyboard(scenes: List[Dict], current_page: int = 0, scenes_p
     
     buttons = []
     for scene in scenes[start_idx:end_idx]:
-        icon = "📄"
-        if scene['content_type'] == 'photo':
-            icon = "🖼️"
-        elif scene['content_type'] == 'video':
-            icon = "🎥"
-        
+        messages = json.loads(scene['messages_json'])
+        message_count = len(messages)
         buttons.append([
             InlineKeyboardButton(
-                text=f"{icon} {scene['name']}",
+                text=f"📄 {scene['name']} ({message_count} сообщ.)",
                 callback_data=f"scene_{scene['name']}"
             )
         ])
@@ -377,12 +452,6 @@ def get_scenes_list_keyboard(scenes: List[Dict], current_page: int = 0, scenes_p
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-def add_watermark(text: str) -> str:
-    """Добавление вотермарки к тексту"""
-    if text:
-        return WATERMARK + text
-    return WATERMARK.strip()
-
 def get_content_type_icon(content_type: str) -> str:
     """Получение иконки для типа контента"""
     icons = {
@@ -391,143 +460,6 @@ def get_content_type_icon(content_type: str) -> str:
         'video': '🎥'
     }
     return icons.get(content_type, '📄')
-
-# ========== УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ОТОБРАЖЕНИЯ СЦЕН ==========
-async def render_scene(bot: Bot, chat_id: int, scene: Dict, message_id: int = None) -> Optional[int]:
-    """
-    Универсальная функция отображения сцены
-    Возвращает message_id отправленного сообщения
-    """
-    try:
-        caption = add_watermark(scene['caption']) if scene['caption'] else WATERMARK.strip()
-        buttons = json.loads(scene['buttons_json']) if scene['buttons_json'] else []
-        
-        # Создаем клавиатуру с кнопками
-        if buttons:
-            keyboard_buttons = []
-            for btn in buttons:
-                if btn['type'] == 'url':
-                    keyboard_buttons.append([
-                        InlineKeyboardButton(text=btn['text'], url=btn['url'])
-                    ])
-                elif btn['type'] == 'scene':
-                    keyboard_buttons.append([
-                        InlineKeyboardButton(
-                            text=btn['text'], 
-                            callback_data=f"scene_{btn['target_scene']}"
-                        )
-                    ])
-            
-            keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-        else:
-            keyboard = None
-        
-        # Отправляем контент в зависимости от типа
-        if scene['content_type'] == 'text':
-            if message_id:
-                # Редактируем существующее сообщение
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=caption,
-                    reply_markup=keyboard
-                )
-                return message_id
-            else:
-                # Отправляем новое сообщение
-                msg = await bot.send_message(
-                    chat_id=chat_id,
-                    text=caption,
-                    reply_markup=keyboard
-                )
-                return msg.message_id
-                
-        elif scene['content_type'] == 'photo' and scene['file_id']:
-            if message_id:
-                # Редактируем существующее сообщение с фото
-                try:
-                    await bot.edit_message_media(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        media=InputMediaPhoto(
-                            media=scene['file_id'],
-                            caption=caption
-                        ),
-                        reply_markup=keyboard
-                    )
-                    return message_id
-                except:
-                    # Если не удалось редактировать медиа, удаляем старое и отправляем новое
-                    await bot.delete_message(chat_id, message_id)
-                    msg = await bot.send_photo(
-                        chat_id=chat_id,
-                        photo=scene['file_id'],
-                        caption=caption,
-                        reply_markup=keyboard
-                    )
-                    return msg.message_id
-            else:
-                # Отправляем новое фото
-                msg = await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=scene['file_id'],
-                    caption=caption,
-                    reply_markup=keyboard
-                )
-                return msg.message_id
-                
-        elif scene['content_type'] == 'video' and scene['file_id']:
-            if message_id:
-                # Редактируем существующее сообщение с видео
-                try:
-                    await bot.edit_message_media(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        media=InputMediaVideo(
-                            media=scene['file_id'],
-                            caption=caption
-                        ),
-                        reply_markup=keyboard
-                    )
-                    return message_id
-                except:
-                    # Если не удалось редактировать медиа, удаляем старое и отправляем новое
-                    await bot.delete_message(chat_id, message_id)
-                    msg = await bot.send_video(
-                        chat_id=chat_id,
-                        video=scene['file_id'],
-                        caption=caption,
-                        reply_markup=keyboard
-                    )
-                    return msg.message_id
-            else:
-                # Отправляем новое видео
-                msg = await bot.send_video(
-                    chat_id=chat_id,
-                    video=scene['file_id'],
-                    caption=caption,
-                    reply_markup=keyboard
-                )
-                return msg.message_id
-        else:
-            # Ошибка загрузки сцены
-            if message_id:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=add_watermark("Ошибка загрузки сцены")
-                )
-                return message_id
-            else:
-                msg = await bot.send_message(
-                    chat_id=chat_id,
-                    text=add_watermark("Ошибка загрузки сцены")
-                )
-                return msg.message_id
-                
-    except Exception as e:
-        logger.error(f"Ошибка отображения сцены: {e}")
-        return None
 
 # ========== ОБРАБОТЧИКИ ОСНОВНОГО БОТА ==========
 @main_router.message(CommandStart())
@@ -540,38 +472,57 @@ async def cmd_start(message: Message, state: FSMContext):
     
     if user_bot:
         await message.answer(
-            "👋 Добро пожаловать в конструктор ботов с медиа-сценами!\n\n"
+            "👋 Добро пожаловать в конструктор ботов с системой переменных!\n\n"
             "Выберите действие:",
             reply_markup=get_main_keyboard()
         )
     else:
         await message.answer(
-            "🤖 <b>Добро пожаловать в конструктор Telegram-ботов с медиа-сценами!</b>\n\n"
+            "🤖 <b>Добро пожаловать в конструктор Telegram-ботов!</b>\n\n"
             "Для начала работы вам необходимо предоставить токен вашего бота.\n\n"
             "<i>Отправьте токен бота, полученный от @BotFather:</i>"
         )
         await state.set_state(BotConstructorStates.waiting_for_token)
 
-@main_router.message(Command("help"))
-async def cmd_help(message: Message):
-    """Обработчик команды /help"""
+@main_router.callback_query(F.data == "help")
+async def help_callback(callback: CallbackQuery):
+    """Обработчик кнопки помощи"""
+    await callback.answer()
+    
     help_text = (
-        "📚 <b>Конструктор ботов с медиа-сценами</b>\n\n"
-        "Создавайте ботов с поддержкой фото и видео!\n\n"
-        "<b>Основные функции:</b>\n"
-        "1. 🆕 <b>Создание сцен</b> с различным контентом:\n"
-        "   • 📝 Текстовые сообщения\n"
-        "   • 🖼️ Фотографии\n"
-        "   • 🎥 Видео\n"
-        "2. 🔘 <b>Интерактивные кнопки</b>:\n"
-        "   • 🔗 Ссылки на внешние ресурсы\n"
-        "   • 🔄 Переходы между сценами\n"
-        "3. ▶️ <b>Управление ботом</b> - запуск и остановка\n"
-        "4. ⚒️ <b>Автоматическая вотермарка</b>\n"
-        "5. ✏️ <b>Редактирование сцен</b>\n\n"
-        "Для начала работы используйте /start"
+        "📚 <b>Помощь по конструктору ботов</b>\n\n"
+        "<b>Как создавать сцены:</b>\n"
+        "1. Нажмите '🆕 Создать сцену'\n"
+        "2. Введите уникальное имя сцены (латинские буквы, без пробелов)\n"
+        "3. Введите текст сообщения\n"
+        "4. Можете добавить дополнительные сообщения в сцену\n"
+        "5. Добавьте кнопки к последнему сообщению\n\n"
+        
+        "<b>Типы кнопок:</b>\n"
+        "• 🔗 Ссылка (URL) - ведет на внешний сайт\n"
+        "• 🔄 Переход на сцену - меняет текущее сообщение\n"
+        "• ⭐ Изменить переменную - изменяет значение переменной ##stars##\n\n"
+        
+        "<b>Система переменных (плейсхолдеры):</b>\n"
+        "В тексте сообщений можно использовать:\n"
+        "• <code>##stars##</code> - количество звезд (изменяется через кнопки)\n"
+        "• <code>##name_user##</code> - имя пользователя\n"
+        "• <code>##ID_user##</code> - ID пользователя в Telegram\n"
+        "• <code>##user_user##</code> - username пользователя\n\n"
+        
+        "<b>Пример текста:</b>\n"
+        "<code>Привет, ##name_user##! У тебя ##stars## звезд.</code>\n\n"
+        
+        "<b>Вотермарка:</b>\n"
+        "При команде /start во всех созданных ботах автоматически отправляется сообщение с вотермаркой."
     )
-    await message.answer(help_text)
+    
+    await callback.message.edit_text(
+        help_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")]
+        ])
+    )
 
 @main_router.message(BotConstructorStates.waiting_for_token)
 async def process_token(message: Message, state: FSMContext):
@@ -596,14 +547,14 @@ async def process_token(message: Message, state: FSMContext):
         # Создаем стартовую сцену
         user_bot = await get_user_bot(user_id)
         if user_bot:
-            await save_scene(user_bot['id'], 'start', 'text', caption='Добро пожаловать!')
+            await save_scene(user_bot['id'], 'start', ['Добро пожаловать! У тебя ##stars## звезд.'])
         
         await state.clear()
         
         await wait_msg.edit_text(
             f"✅ <b>Токен успешно проверен!</b>\n\n"
             f"Бот: @{bot_username}\n\n"
-            f"Создана стартовая текстовая сцена 'start'. Вы можете ее отредактировать.",
+            f"Создана стартовая сцена 'start'. Вы можете ее отредактировать.",
             reply_markup=get_main_keyboard()
         )
     else:
@@ -626,7 +577,7 @@ async def create_scene_callback(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "🆕 <b>Создание новой сцены</b>\n\n"
         "Введите уникальное имя для сцены (на английском, без пробелов):\n"
-        "<i>Пример: main_menu, catalog, about</i>",
+        "<i>Пример: main_menu, profile, shop</i>",
         reply_markup=get_cancel_keyboard()
     )
     
@@ -659,48 +610,22 @@ async def process_scene_name(message: Message, state: FSMContext):
         return
     
     await state.update_data(scene_name=scene_name)
-    await state.set_state(BotConstructorStates.waiting_content_type)
+    await state.set_state(BotConstructorStates.waiting_scene_message)
     
     await message.answer(
         f"✅ Имя сцены: <b>{scene_name}</b>\n\n"
-        "Что отправить в этой сцене?",
-        reply_markup=get_content_type_keyboard()
+        "Введите текст первого сообщения для этой сцены:\n\n"
+        "<b>Доступные переменные:</b>\n"
+        "<code>##stars##</code> - количество звезд\n"
+        "<code>##name_user##</code> - имя пользователя\n"
+        "<code>##ID_user##</code> - ID пользователя\n"
+        "<code>##user_user##</code> - username\n\n"
+        "<i>Пример: Привет, ##name_user##! У тебя ##stars## звезд.</i>",
+        reply_markup=get_cancel_keyboard()
     )
 
-@main_router.callback_query(F.data.in_(["content_text", "content_photo", "content_video"]))
-async def content_type_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик выбора типа контента"""
-    await callback.answer()
-    
-    content_type = callback.data.replace("content_", "")
-    
-    await state.update_data(content_type=content_type)
-    
-    if content_type == "text":
-        await state.set_state(BotConstructorStates.waiting_scene_text)
-        await callback.message.edit_text(
-            "📝 <b>Текстовая сцена</b>\n\n"
-            "Введите текст сообщения:\n"
-            "<i>Вотермарка будет добавлена автоматически</i>",
-            reply_markup=get_cancel_keyboard()
-        )
-    elif content_type == "photo":
-        await state.set_state(BotConstructorStates.waiting_scene_photo)
-        await callback.message.edit_text(
-            "🖼️ <b>Фото-сцена</b>\n\n"
-            "Отправьте фото (как файл, не как сжатое изображение):",
-            reply_markup=get_cancel_keyboard()
-        )
-    elif content_type == "video":
-        await state.set_state(BotConstructorStates.waiting_scene_video)
-        await callback.message.edit_text(
-            "🎥 <b>Видео-сцена</b>\n\n"
-            "Отправьте видео (файлом):",
-            reply_markup=get_cancel_keyboard()
-        )
-
-@main_router.message(BotConstructorStates.waiting_scene_text)
-async def process_scene_text(message: Message, state: FSMContext):
+@main_router.message(BotConstructorStates.waiting_scene_message)
+async def process_scene_message(message: Message, state: FSMContext):
     """Обработка ввода текста сцены"""
     scene_text = message.text
     
@@ -708,97 +633,87 @@ async def process_scene_text(message: Message, state: FSMContext):
     bot_id = data['bot_id']
     scene_name = data['scene_name']
     
-    # Сохраняем сцену с вотермаркой
-    await save_scene(bot_id, scene_name, 'text', caption=scene_text)
-    
-    await state.update_data(scene_text=scene_text)
+    # Сохраняем первое сообщение
+    await state.update_data(scene_messages=[scene_text])
     
     await message.answer(
-        f"✅ <b>Текстовая сцена '{scene_name}' создана!</b>\n\n"
-        f"Текст сцены (с вотермаркой):\n"
-        f"{add_watermark(scene_text)}\n\n"
-        "Теперь вы можете добавить кнопки к этой сцене:",
-        reply_markup=get_scene_management_keyboard(scene_name)
+        f"✅ <b>Первое сообщение добавлено!</b>\n\n"
+        f"Текст сообщения (с вотермаркой):\n"
+        f"{WATERMARK_IN_TEXT}{scene_text}\n\n"
+        "Хотите добавить еще одно сообщение в эту сцену?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, добавить", callback_data="add_more_messages"),
+                InlineKeyboardButton(text="❌ Нет, хватит", callback_data="no_more_messages")
+            ]
+        ])
     )
-    
-    # Очищаем состояние
-    await state.set_state(None)
 
-@main_router.message(BotConstructorStates.waiting_scene_photo)
-async def process_scene_photo(message: Message, state: FSMContext):
-    """Обработка загрузки фото"""
-    if not message.photo:
-        await message.answer(
-            "❌ <b>Пожалуйста, отправьте фото!</b>\n\n"
-            "Отправьте фото (как файл, не как сжатое изображение):",
-            reply_markup=get_cancel_keyboard()
-        )
-        return
+@main_router.callback_query(F.data == "add_more_messages")
+async def add_more_messages_callback(callback: CallbackQuery, state: FSMContext):
+    """Обработчик добавления дополнительных сообщений"""
+    await callback.answer()
     
-    # Берем фото с максимальным разрешением
-    photo = message.photo[-1]
-    file_id = photo.file_id
+    await state.set_state(BotConstructorStates.waiting_more_messages)
     
-    data = await state.get_data()
-    await state.update_data(file_id=file_id)
-    await state.set_state(BotConstructorStates.waiting_scene_caption)
-    
-    await message.answer(
-        "✅ <b>Фото получено!</b>\n\n"
-        "Теперь введите подпись для фото:\n"
-        "<i>Вотермарка будет добавлена автоматически</i>",
+    await callback.message.edit_text(
+        "➕ <b>Добавление сообщения</b>\n\n"
+        "Введите текст следующего сообщения для этой сцены:\n\n"
+        "<b>Доступные переменные:</b>\n"
+        "<code>##stars##</code> - количество звезд\n"
+        "<code>##name_user##</code> - имя пользователя\n"
+        "<code>##ID_user##</code> - ID пользователя\n"
+        "<code>##user_user##</code> - username",
         reply_markup=get_cancel_keyboard()
     )
 
-@main_router.message(BotConstructorStates.waiting_scene_video)
-async def process_scene_video(message: Message, state: FSMContext):
-    """Обработка загрузки видео"""
-    if not message.video:
-        await message.answer(
-            "❌ <b>Пожалуйста, отправьте видео!</b>\n\n"
-            "Отправьте видео (файлом):",
-            reply_markup=get_cancel_keyboard()
-        )
-        return
-    
-    video = message.video
-    file_id = video.file_id
+@main_router.message(BotConstructorStates.waiting_more_messages)
+async def process_more_messages(message: Message, state: FSMContext):
+    """Обработка ввода дополнительных сообщений"""
+    new_message = message.text
     
     data = await state.get_data()
-    await state.update_data(file_id=file_id)
-    await state.set_state(BotConstructorStates.waiting_scene_caption)
+    scene_messages = data.get('scene_messages', [])
+    scene_messages.append(new_message)
+    
+    await state.update_data(scene_messages=scene_messages)
     
     await message.answer(
-        "✅ <b>Видео получено!</b>\n\n"
-        "Теперь введите подпись для видео:\n"
-        "<i>Вотермарка будет добавлена автоматически</i>",
-        reply_markup=get_cancel_keyboard()
+        f"✅ <b>Сообщение {len(scene_messages)} добавлено!</b>\n\n"
+        f"Всего сообщений в сцене: {len(scene_messages)}\n\n"
+        "Хотите добавить еще одно сообщение?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, добавить", callback_data="add_more_messages"),
+                InlineKeyboardButton(text="❌ Нет, хватит", callback_data="no_more_messages")
+            ]
+        ])
     )
 
-@main_router.message(BotConstructorStates.waiting_scene_caption)
-async def process_scene_caption(message: Message, state: FSMContext):
-    """Обработка ввода подписи для медиа"""
-    caption = message.text
+@main_router.callback_query(F.data == "no_more_messages")
+async def no_more_messages_callback(callback: CallbackQuery, state: FSMContext):
+    """Обработчик завершения добавления сообщений"""
+    await callback.answer()
     
     data = await state.get_data()
     bot_id = data['bot_id']
     scene_name = data['scene_name']
-    content_type = data['content_type']
-    file_id = data.get('file_id')
+    scene_messages = data.get('scene_messages', [])
     
-    # Сохраняем сцену
-    await save_scene(bot_id, scene_name, content_type, file_id=file_id, caption=caption)
+    # Сохраняем сцену с сообщениями
+    await save_scene(bot_id, scene_name, scene_messages)
     
-    await message.answer(
-        f"✅ <b>Медиа-сцена '{scene_name}' создана!</b>\n\n"
-        f"Тип: {content_type}\n"
-        f"Подпись (с вотермаркой):\n{add_watermark(caption)}\n\n"
-        "Теперь вы можете добавить кнопки к этой сцене:",
+    await callback.message.edit_text(
+        f"✅ <b>Сцена '{scene_name}' создана!</b>\n\n"
+        f"Количество сообщений: {len(scene_messages)}\n"
+        "Теперь вы можете добавить кнопки к последнему сообщению:",
         reply_markup=get_scene_management_keyboard(scene_name)
     )
-    
-    # Очищаем состояние
-    await state.set_state(None)
+
+@main_router.callback_query(F.data.in_(["content_photo_disabled", "content_video_disabled"]))
+async def media_disabled_callback(callback: CallbackQuery):
+    """Обработчик выбора недоступного типа контента"""
+    await callback.answer("Данная функция временно недоступна", show_alert=True)
 
 @main_router.callback_query(F.data == "add_button_to_scene")
 async def add_button_to_scene_callback(callback: CallbackQuery, state: FSMContext):
@@ -824,10 +739,11 @@ async def add_button_to_scene_callback(callback: CallbackQuery, state: FSMContex
     # Создаем клавиатуру выбора сцены для добавления кнопки
     scene_buttons = []
     for scene in scenes:
-        icon = get_content_type_icon(scene['content_type'])
+        messages = json.loads(scene['messages_json'])
+        message_count = len(messages)
         scene_buttons.append([
             InlineKeyboardButton(
-                text=f"{icon} {scene['name']}",
+                text=f"📄 {scene['name']} ({message_count} сообщ.)",
                 callback_data=f"select_scene_{scene['name']}"
             )
         ])
@@ -888,10 +804,11 @@ async def button_type_scene_callback(callback: CallbackQuery, state: FSMContext)
     
     scene_buttons = []
     for scene in scenes:
-        icon = get_content_type_icon(scene['content_type'])
+        messages = json.loads(scene['messages_json'])
+        message_count = len(messages)
         scene_buttons.append([
             InlineKeyboardButton(
-                text=f"{icon} {scene['name']}",
+                text=f"📄 {scene['name']} ({message_count} сообщ.)",
                 callback_data=f"target_scene_{scene['name']}"
             )
         ])
@@ -908,6 +825,20 @@ async def button_type_scene_callback(callback: CallbackQuery, state: FSMContext)
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(BotConstructorStates.waiting_button_text)
+
+@main_router.callback_query(F.data == "button_type_variable")
+async def button_type_variable_callback(callback: CallbackQuery, state: FSMContext):
+    """Выбор типа кнопки - изменение переменной"""
+    await callback.answer()
+    
+    await state.update_data(button_type="variable")
+    await state.set_state(BotConstructorStates.waiting_button_text)
+    
+    await callback.message.edit_text(
+        "⭐ <b>Создание кнопки изменения переменной</b>\n\n"
+        "Введите текст для кнопки (например: 'Получить звезду'):",
+        reply_markup=get_cancel_keyboard()
+    )
 
 @main_router.message(BotConstructorStates.waiting_button_text)
 async def process_button_text(message: Message, state: FSMContext):
@@ -934,10 +865,11 @@ async def process_button_text(message: Message, state: FSMContext):
         
         scene_buttons = []
         for scene in scenes:
-            icon = get_content_type_icon(scene['content_type'])
+            messages = json.loads(scene['messages_json'])
+            message_count = len(messages)
             scene_buttons.append([
                 InlineKeyboardButton(
-                    text=f"{icon} {scene['name']}",
+                    text=f"📄 {scene['name']} ({message_count} сообщ.)",
                     callback_data=f"target_scene_{scene['name']}"
                 )
             ])
@@ -950,6 +882,14 @@ async def process_button_text(message: Message, state: FSMContext):
             f"📝 Текст кнопки: <b>{button_text}</b>\n\n"
             "Выберите сцену, на которую будет вести кнопка:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=scene_buttons)
+        )
+    elif button_type == "variable":
+        await state.set_state(BotConstructorStates.waiting_variable_action)
+        
+        await message.answer(
+            f"📝 Текст кнопки: <b>{button_text}</b>\n\n"
+            "Выберите действие с переменной 'stars':",
+            reply_markup=get_variable_action_keyboard()
         )
 
 @main_router.message(BotConstructorStates.waiting_button_url)
@@ -996,7 +936,66 @@ async def target_scene_callback(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_scene_management_keyboard(data.get('selected_scene'))
     )
 
-async def save_button_to_scene(data: Dict, url: str = None, target_scene: str = None):
+@main_router.callback_query(F.data.startswith("var_action_"))
+async def variable_action_callback(callback: CallbackQuery, state: FSMContext):
+    """Обработчик выбора действия с переменной"""
+    await callback.answer()
+    
+    action = callback.data.replace("var_action_", "")
+    
+    data = await state.get_data()
+    
+    if action in ["plus_1", "minus_1"]:
+        # Для простых действий сразу сохраняем кнопку
+        action_type = "+1" if action == "plus_1" else "-1"
+        await save_button_to_scene(data, variable_action=action_type)
+        await state.clear()
+        
+        action_text = "увеличить на 1" if action == "plus_1" else "уменьшить на 1"
+        await callback.message.edit_text(
+            "✅ <b>Кнопка изменения переменной добавлена!</b>\n\n"
+            f"Текст: {data['button_text']}\n"
+            f"Действие: {action_text}\n"
+            f"Переменная: stars\n\n"
+            "Вы можете добавить еще кнопки или завершить сцену.",
+            reply_markup=get_scene_management_keyboard(data.get('selected_scene'))
+        )
+    elif action == "set":
+        # Для установки значения запрашиваем число
+        await state.set_state(BotConstructorStates.waiting_variable_value)
+        
+        await callback.message.edit_text(
+            "✏️ <b>Установка значения переменной</b>\n\n"
+            "Введите новое значение для переменной 'stars' (целое число):",
+            reply_markup=get_cancel_keyboard()
+        )
+
+@main_router.message(BotConstructorStates.waiting_variable_value)
+async def process_variable_value(message: Message, state: FSMContext):
+    """Обработка ввода значения переменной"""
+    try:
+        value = int(message.text)
+        
+        data = await state.get_data()
+        await save_button_to_scene(data, variable_action=f"set:{value}")
+        await state.clear()
+        
+        await message.answer(
+            "✅ <b>Кнопка изменения переменной добавлена!</b>\n\n"
+            f"Текст: {data['button_text']}\n"
+            f"Действие: установить значение {value}\n"
+            f"Переменная: stars\n\n"
+            "Вы можете добавить еще кнопки или завершить сцену.",
+            reply_markup=get_scene_management_keyboard(data.get('selected_scene'))
+        )
+    except ValueError:
+        await message.answer(
+            "❌ <b>Некорректное значение!</b>\n\n"
+            "Пожалуйста, введите целое число:",
+            reply_markup=get_cancel_keyboard()
+        )
+
+async def save_button_to_scene(data: Dict, url: str = None, target_scene: str = None, variable_action: str = None):
     """Сохранение кнопки в сцену"""
     bot_id = data['bot_id']
     scene_name = data['selected_scene']
@@ -1013,11 +1012,114 @@ async def save_button_to_scene(data: Dict, url: str = None, target_scene: str = 
         button_data["url"] = url
     elif button_type == "scene" and target_scene:
         button_data["target_scene"] = target_scene
+    elif button_type == "variable" and variable_action:
+        button_data["variable_action"] = variable_action
     
     buttons.append(button_data)
     
     # Сохраняем обновленные кнопки
     await update_scene_buttons(bot_id, scene_name, buttons)
+
+@main_router.callback_query(F.data == "add_message_to_scene")
+async def add_message_to_scene_callback(callback: CallbackQuery, state: FSMContext):
+    """Обработчик добавления сообщения к существующей сцене"""
+    await callback.answer()
+    
+    user_bot = await get_user_bot(callback.from_user.id)
+    if not user_bot:
+        return
+    
+    # Получаем сцены пользователя
+    scenes = await get_bot_scenes(user_bot['id'])
+    
+    if not scenes:
+        await callback.message.edit_text(
+            "📭 <b>У вас еще нет сцен</b>\n\n"
+            "Сначала создайте сцену!"
+        )
+        return
+    
+    # Создаем клавиатуру выбора сцены
+    scene_buttons = []
+    for scene in scenes:
+        messages = json.loads(scene['messages_json'])
+        message_count = len(messages)
+        scene_buttons.append([
+            InlineKeyboardButton(
+                text=f"📄 {scene['name']} ({message_count} сообщ.)",
+                callback_data=f"add_msg_scene_{scene['name']}"
+            )
+        ])
+    
+    scene_buttons.append([
+        InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
+    ])
+    
+    await callback.message.edit_text(
+        "➕ <b>Добавление сообщения к сцене</b>\n\n"
+        "Выберите сцену, к которой хотите добавить сообщение:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=scene_buttons)
+    )
+
+@main_router.callback_query(F.data.startswith("add_msg_scene_"))
+async def add_msg_to_scene_callback(callback: CallbackQuery, state: FSMContext):
+    """Обработчик выбора сцены для добавления сообщения"""
+    await callback.answer()
+    
+    scene_name = callback.data.replace("add_msg_scene_", "")
+    
+    user_bot = await get_user_bot(callback.from_user.id)
+    if not user_bot:
+        return
+    
+    scene = await get_scene(user_bot['id'], scene_name)
+    
+    if not scene:
+        await callback.answer("Сцена не найдена!")
+        return
+    
+    await state.update_data(
+        bot_id=user_bot['id'],
+        scene_name=scene_name,
+        current_messages=json.loads(scene['messages_json'])
+    )
+    
+    await state.set_state(BotConstructorStates.waiting_new_message)
+    
+    await callback.message.edit_text(
+        f"➕ <b>Добавление сообщения к сцене '{scene_name}'</b>\n\n"
+        "Введите текст нового сообщения:\n\n"
+        "<b>Доступные переменные:</b>\n"
+        "<code>##stars##</code> - количество звезд\n"
+        "<code>##name_user##</code> - имя пользователя\n"
+        "<code>##ID_user##</code> - ID пользователя\n"
+        "<code>##user_user##</code> - username",
+        reply_markup=get_cancel_keyboard()
+    )
+
+@main_router.message(BotConstructorStates.waiting_new_message)
+async def process_new_message(message: Message, state: FSMContext):
+    """Обработка ввода нового сообщения для сцены"""
+    new_message = message.text
+    
+    data = await state.get_data()
+    bot_id = data['bot_id']
+    scene_name = data['scene_name']
+    current_messages = data['current_messages']
+    
+    # Добавляем новое сообщение
+    current_messages.append(new_message)
+    
+    # Обновляем сцену
+    await update_scene_messages(bot_id, scene_name, current_messages)
+    
+    await state.clear()
+    
+    await message.answer(
+        f"✅ <b>Сообщение добавлено к сцене '{scene_name}'!</b>\n\n"
+        f"Теперь в сцене {len(current_messages)} сообщений.",
+        reply_markup=get_scene_management_keyboard(scene_name)
+    )
 
 @main_router.callback_query(F.data == "my_scenes")
 async def my_scenes_callback(callback: CallbackQuery):
@@ -1065,158 +1167,38 @@ async def scene_detail_callback(callback: CallbackQuery):
         await callback.answer("Сцена не найдена!")
         return
     
+    messages = json.loads(scene['messages_json'])
     buttons = json.loads(scene['buttons_json']) if scene['buttons_json'] else []
-    icon = get_content_type_icon(scene['content_type'])
     
-    scene_info = f"{icon} <b>Сцена: {scene['name']}</b>\n\n"
+    scene_info = f"📄 <b>Сцена: {scene['name']}</b>\n\n"
+    scene_info += f"<b>Количество сообщений:</b> {len(messages)}\n\n"
     
-    if scene['content_type'] == 'text':
-        scene_info += f"<b>Тип:</b> Текст\n"
-        scene_info += f"<b>Текст (с вотермаркой):</b>\n{add_watermark(scene['caption'])}\n\n"
-    else:
-        scene_info += f"<b>Тип:</b> {'Фото' if scene['content_type'] == 'photo' else 'Видео'}\n"
-        scene_info += f"<b>Подпись (с вотермаркой):</b>\n{add_watermark(scene['caption'])}\n\n"
+    scene_info += "<b>Сообщения:</b>\n"
+    for i, msg in enumerate(messages, 1):
+        scene_info += f"{i}. {msg[:50]}...\n"
     
     if buttons:
-        scene_info += "<b>Кнопки:</b>\n"
+        scene_info += "\n<b>Кнопки:</b>\n"
         for i, btn in enumerate(buttons, 1):
             if btn['type'] == 'url':
                 scene_info += f"{i}. {btn['text']} → {btn['url']}\n"
-            else:
+            elif btn['type'] == 'scene':
                 scene_info += f"{i}. {btn['text']} → сцена: {btn['target_scene']}\n"
+            elif btn['type'] == 'variable':
+                action = btn.get('variable_action', '')
+                if action == "+1":
+                    scene_info += f"{i}. {btn['text']} → +1 звезда\n"
+                elif action == "-1":
+                    scene_info += f"{i}. {btn['text']} → -1 звезда\n"
+                elif action.startswith("set:"):
+                    value = action.replace("set:", "")
+                    scene_info += f"{i}. {btn['text']} → установить {value} звезд\n"
     else:
-        scene_info += "<i>Кнопок пока нет</i>\n"
+        scene_info += "\n<i>Кнопок пока нет</i>\n"
     
     await callback.message.edit_text(
         scene_info,
         reply_markup=get_scene_management_keyboard(scene_name)
-    )
-
-@main_router.callback_query(F.data.startswith("edit_scene_"))
-async def edit_scene_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик редактирования сцены"""
-    await callback.answer()
-    
-    scene_name = callback.data.replace("edit_scene_", "")
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    if not user_bot:
-        return
-    
-    scene = await get_scene(user_bot['id'], scene_name)
-    
-    if not scene:
-        await callback.answer("Сцена не найдена!")
-        return
-    
-    # Сохраняем данные о редактируемой сцене
-    await state.update_data(
-        bot_id=user_bot['id'],
-        scene_name=scene_name,
-        current_content_type=scene['content_type']
-    )
-    
-    await state.set_state(BotConstructorStates.waiting_edit_content)
-    
-    await callback.message.edit_text(
-        f"✏️ <b>Редактирование сцены '{scene_name}'</b>\n\n"
-        "Что вы хотите изменить?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📝 Изменить текст/подпись", callback_data="edit_caption")
-            ],
-            [
-                InlineKeyboardButton(text="🖼️/🎥 Изменить медиа", callback_data="edit_media")
-            ],
-            [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit")
-            ]
-        ])
-    )
-
-@main_router.callback_query(F.data == "edit_caption")
-async def edit_caption_callback(callback: CallbackQuery, state: FSMContext):
-    """Редактирование подписи/текста"""
-    await callback.answer()
-    
-    data = await state.get_data()
-    
-    await state.set_state(BotConstructorStates.waiting_edit_caption)
-    
-    if data.get('current_content_type') == 'text':
-        await callback.message.edit_text(
-            "📝 <b>Редактирование текста</b>\n\n"
-            "Введите новый текст сцены:",
-            reply_markup=get_cancel_keyboard()
-        )
-    else:
-        await callback.message.edit_text(
-            "📝 <b>Редактирование подписи</b>\n\n"
-            "Введите новую подпись для медиа:",
-            reply_markup=get_cancel_keyboard()
-        )
-
-@main_router.message(BotConstructorStates.waiting_edit_caption)
-async def process_edit_caption(message: Message, state: FSMContext):
-    """Обработка нового текста/подписи"""
-    new_caption = message.text
-    
-    data = await state.get_data()
-    bot_id = data['bot_id']
-    scene_name = data['scene_name']
-    
-    # Обновляем подпись в базе данных
-    await update_scene_content(bot_id, scene_name, caption=new_caption)
-    
-    await state.clear()
-    
-    await message.answer(
-        "✅ <b>Текст/подпись успешно обновлены!</b>\n\n"
-        f"Новый текст (с вотермаркой):\n{add_watermark(new_caption)}",
-        reply_markup=get_scene_management_keyboard(scene_name)
-    )
-
-@main_router.callback_query(F.data == "edit_media")
-async def edit_media_callback(callback: CallbackQuery, state: FSMContext):
-    """Редактирование медиафайла"""
-    await callback.answer()
-    
-    data = await state.get_data()
-    content_type = data.get('current_content_type')
-    
-    if content_type == 'text':
-        await callback.message.edit_text(
-            "❌ <b>Невозможно изменить медиа для текстовой сцены!</b>\n\n"
-            "Вы можете изменить только текст.",
-            reply_markup=get_scene_management_keyboard(data.get('scene_name'))
-        )
-        return
-    
-    await state.set_state(BotConstructorStates.waiting_content_type)
-    
-    await callback.message.edit_text(
-        "🔄 <b>Изменение медиафайла</b>\n\n"
-        "Выберите новый тип контента:",
-        reply_markup=get_content_type_keyboard()
-    )
-
-@main_router.callback_query(F.data == "cancel_edit")
-async def cancel_edit_callback(callback: CallbackQuery, state: FSMContext):
-    """Отмена редактирования"""
-    await callback.answer()
-    
-    await state.clear()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    if not user_bot:
-        return
-    
-    scenes = await get_bot_scenes(user_bot['id'])
-    
-    await callback.message.edit_text(
-        f"📋 <b>Ваши сцены ({len(scenes)})</b>\n\n"
-        "Выберите сцену для просмотра или редактирования:",
-        reply_markup=get_scenes_list_keyboard(scenes)
     )
 
 @main_router.callback_query(F.data == "finish_scene")
@@ -1337,24 +1319,20 @@ async def bot_status_callback(callback: CallbackQuery):
     is_running = token in user_bots
     
     scenes = await get_bot_scenes(user_bot['id'])
-    text_count = len([s for s in scenes if s['content_type'] == 'text'])
-    photo_count = len([s for s in scenes if s['content_type'] == 'photo'])
-    video_count = len([s for s in scenes if s['content_type'] == 'video'])
+    total_messages = sum(len(json.loads(s['messages_json'])) for s in scenes)
     
     status_text = f"📊 <b>Статус бота @{user_bot['bot_username']}</b>\n\n"
     status_text += f"• Статус: {'🟢 Запущен' if is_running else '🔴 Остановлен'}\n"
-    status_text += f"• Всего сцен: {len(scenes)}\n"
-    status_text += f"  - 📝 Текстовых: {text_count}\n"
-    status_text += f"  - 🖼️ Фото: {photo_count}\n"
-    status_text += f"  - 🎥 Видео: {video_count}\n"
+    status_text += f"• Сцен: {len(scenes)}\n"
+    status_text += f"• Сообщений: {total_messages}\n"
     status_text += f"• Создан: {datetime.fromisoformat(user_bot['created_at']).strftime('%d.%m.%Y')}\n\n"
     
     if scenes:
         status_text += "<b>Последние сцены:</b>\n"
         for scene in scenes[:3]:
-            icon = get_content_type_icon(scene['content_type'])
+            messages = json.loads(scene['messages_json'])
             buttons = json.loads(scene['buttons_json']) if scene['buttons_json'] else []
-            status_text += f"• {icon} {scene['name']} ({len(buttons)} кнопок)\n"
+            status_text += f"• {scene['name']} ({len(messages)} сообщ., {len(buttons)} кнопок)\n"
         
         if len(scenes) > 3:
             status_text += f"... и еще {len(scenes) - 3} сцен\n"
@@ -1452,29 +1430,82 @@ async def create_user_bot_handlers(token: str, bot_data: Dict):
     """Создание обработчиков для пользовательского бота"""
     router = Router()
     
-    # Хранилище для message_id последней отправленной сцены
-    user_last_messages = {}
-    
     @router.message(CommandStart())
     async def user_bot_start(message: Message):
         """Обработчик команды /start для пользовательского бота"""
+        # Отправляем вотермарку отдельным сообщением ПЕРВЫМ делом
+        await message.answer(WATERMARK_MESSAGE)
+        
         start_scene_name = bot_data.get('start_scene', 'start')
         scene = await get_scene(bot_data['id'], start_scene_name)
         
         if not scene:
-            await message.answer(add_watermark("Добро пожаловать! Сцена 'start' не настроена."))
+            await message.answer("Добро пожаловать! Сцена 'start' не настроена.")
             return
         
-        # Отправляем сцену
-        message_id = await render_scene(message.bot, message.chat.id, scene)
+        # Получаем значение переменной stars для пользователя
+        stars_value = await get_user_variable(bot_data['id'], message.from_user.id, "stars")
         
-        # Сохраняем message_id для этого пользователя
-        user_last_messages[message.chat.id] = message_id
+        # Отправляем все сообщения сцены
+        messages = json.loads(scene['messages_json'])
+        buttons = json.loads(scene['buttons_json']) if scene['buttons_json'] else []
+        
+        # Отправляем все сообщения, кроме последнего
+        for msg in messages[:-1]:
+            parsed_text = parse_placeholders(
+                msg, 
+                {
+                    'id': message.from_user.id,
+                    'first_name': message.from_user.first_name,
+                    'username': message.from_user.username
+                },
+                stars_value
+            )
+            await message.answer(parsed_text)
+        
+        # Последнее сообщение с кнопками (если есть)
+        if messages:
+            last_msg = messages[-1]
+            parsed_text = parse_placeholders(
+                last_msg, 
+                {
+                    'id': message.from_user.id,
+                    'first_name': message.from_user.first_name,
+                    'username': message.from_user.username
+                },
+                stars_value
+            )
+            
+            if buttons:
+                keyboard_buttons = []
+                for btn in buttons:
+                    if btn['type'] == 'url':
+                        keyboard_buttons.append([
+                            InlineKeyboardButton(text=btn['text'], url=btn['url'])
+                        ])
+                    elif btn['type'] == 'scene':
+                        keyboard_buttons.append([
+                            InlineKeyboardButton(
+                                text=btn['text'], 
+                                callback_data=f"scene_{btn['target_scene']}"
+                            )
+                        ])
+                    elif btn['type'] == 'variable':
+                        keyboard_buttons.append([
+                            InlineKeyboardButton(
+                                text=btn['text'], 
+                                callback_data=f"variable_{btn['variable_action']}"
+                            )
+                        ])
+                
+                keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+                await message.answer(parsed_text, reply_markup=keyboard)
+            else:
+                await message.answer(parsed_text)
     
     @router.callback_query(F.data.startswith("scene_"))
     async def user_bot_scene_callback(callback: CallbackQuery):
         """Обработчик перехода между сценами"""
-        # ВАЖНО: Отвечаем сразу, чтобы убрать индикатор загрузки
         await callback.answer()
         
         scene_name = callback.data.replace("scene_", "")
@@ -1484,25 +1515,99 @@ async def create_user_bot_handlers(token: str, bot_data: Dict):
             await callback.message.answer("Сцена не найдена!")
             return
         
-        # Получаем последний message_id для этого чата
-        last_message_id = user_last_messages.get(callback.message.chat.id)
+        # Получаем значение переменной stars для пользователя
+        stars_value = await get_user_variable(bot_data['id'], callback.from_user.id, "stars")
         
-        # Отправляем/редактируем сцену
-        new_message_id = await render_scene(
-            callback.bot, 
-            callback.message.chat.id, 
-            scene,
-            message_id=last_message_id
-        )
+        # Отправляем все сообщения сцены
+        messages = json.loads(scene['messages_json'])
+        buttons = json.loads(scene['buttons_json']) if scene['buttons_json'] else []
         
-        # Обновляем message_id
-        if new_message_id:
-            user_last_messages[callback.message.chat.id] = new_message_id
+        # Отправляем все сообщения, кроме последнего
+        for msg in messages[:-1]:
+            parsed_text = parse_placeholders(
+                msg, 
+                {
+                    'id': callback.from_user.id,
+                    'first_name': callback.from_user.first_name,
+                    'username': callback.from_user.username
+                },
+                stars_value
+            )
+            await callback.message.answer(parsed_text)
+        
+        # Последнее сообщение с кнопками (если есть)
+        if messages:
+            last_msg = messages[-1]
+            parsed_text = parse_placeholders(
+                last_msg, 
+                {
+                    'id': callback.from_user.id,
+                    'first_name': callback.from_user.first_name,
+                    'username': callback.from_user.username
+                },
+                stars_value
+            )
+            
+            if buttons:
+                keyboard_buttons = []
+                for btn in buttons:
+                    if btn['type'] == 'url':
+                        keyboard_buttons.append([
+                            InlineKeyboardButton(text=btn['text'], url=btn['url'])
+                        ])
+                    elif btn['type'] == 'scene':
+                        keyboard_buttons.append([
+                            InlineKeyboardButton(
+                                text=btn['text'], 
+                                callback_data=f"scene_{btn['target_scene']}"
+                            )
+                        ])
+                    elif btn['type'] == 'variable':
+                        keyboard_buttons.append([
+                            InlineKeyboardButton(
+                                text=btn['text'], 
+                                callback_data=f"variable_{btn['variable_action']}"
+                            )
+                        ])
+                
+                keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+                await callback.message.answer(parsed_text, reply_markup=keyboard)
+            else:
+                await callback.message.answer(parsed_text)
+    
+    @router.callback_query(F.data.startswith("variable_"))
+    async def user_bot_variable_callback(callback: CallbackQuery):
+        """Обработчик изменения переменной"""
+        await callback.answer()
+        
+        action = callback.data.replace("variable_", "")
+        current_value = await get_user_variable(bot_data['id'], callback.from_user.id, "stars")
+        
+        if action == "+1":
+            new_value = current_value + 1
+            await update_user_variable(bot_data['id'], callback.from_user.id, "stars", new_value)
+            await callback.message.answer(f"✅ Звезда добавлена! Теперь у тебя {new_value} звезд.")
+        
+        elif action == "-1":
+            new_value = max(0, current_value - 1)  # Не меньше 0
+            await update_user_variable(bot_data['id'], callback.from_user.id, "stars", new_value)
+            await callback.message.answer(f"✅ Звезда убрана! Теперь у тебя {new_value} звезд.")
+        
+        elif action.startswith("set:"):
+            try:
+                new_value = int(action.replace("set:", ""))
+                await update_user_variable(bot_data['id'], callback.from_user.id, "stars", new_value)
+                await callback.message.answer(f"✅ Количество звезд установлено: {new_value}")
+            except ValueError:
+                await callback.message.answer("❌ Ошибка при установке значения")
+        
+        # После изменения переменной возвращаемся к текущей сцене
+        # (можно было бы переотправить текущую сцену, но для простоты просто отправляем сообщение)
     
     @router.message()
     async def user_bot_echo(message: Message):
         """Эхо-обработчик для пользовательского бота"""
-        await message.answer(add_watermark("Используйте /start для начала работы"))
+        await message.answer("Используйте /start для начала работы")
     
     return router
 
@@ -1624,7 +1729,7 @@ async def web_server():
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 async def main():
     """Основная функция запуска бота"""
-    logger.info("Запуск конструктора ботов с медиа-сценами...")
+    logger.info("Запуск конструктора ботов с системой переменных...")
     
     # Инициализация базы данных
     await init_db()
