@@ -3,7 +3,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
@@ -35,23 +35,28 @@ if not BOT_TOKEN:
 
 PORT = int(os.getenv('PORT', 10000))
 
-# ========== ИНИЦИАЛИЗАЦИЯ БОТА И ДИСПЕТЧЕРА ==========
-bot = Bot(
+# ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ УПРАВЛЕНИЯ БОТАМИ ==========
+user_bots: Dict[str, Bot] = {}  # token -> Bot instance
+user_dp_dict: Dict[str, Dispatcher] = {}  # token -> Dispatcher instance
+active_tokens: Set[str] = set()  # Активные токены
+
+# ========== ОСНОВНОЙ БОТ И ДИСПЕТЧЕР ==========
+main_bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-dp.include_router(router)
+main_dp = Dispatcher(storage=MemoryStorage())
+main_router = Router()
+main_dp.include_router(main_router)
 
-# ========== СОСТОЯНИЯ FSM ==========
+# ========== СОСТОЯНИЯ FSM ДЛЯ ОСНОВНОГО БОТА ==========
 class BotConstructorStates(StatesGroup):
     waiting_for_token = State()
     waiting_for_greeting = State()
     waiting_button_text = State()
     waiting_button_url = State()
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+# ========== БАЗА ДАННЫХ ==========
 async def init_db():
     """Инициализация базы данных"""
     async with aiosqlite.connect('database.db') as db:
@@ -117,6 +122,16 @@ async def get_user_bot(user_id: int) -> Optional[Dict]:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
+async def get_bot_by_token(token: str) -> Optional[Dict]:
+    """Получение настроек бота по токену"""
+    async with aiosqlite.connect('database.db') as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT * FROM user_bots WHERE bot_token = ?
+        ''', (token,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
 async def update_greeting(user_id: int, greeting: str):
     """Обновление приветственного сообщения"""
     async with aiosqlite.connect('database.db') as db:
@@ -134,6 +149,16 @@ async def update_buttons(user_id: int, buttons: List[Dict]):
         ''', (buttons_json, user_id))
         await db.commit()
 
+async def get_all_active_bots() -> List[Dict]:
+    """Получение всех активных ботов из БД"""
+    async with aiosqlite.connect('database.db') as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT * FROM user_bots WHERE is_active = 1
+        ''')
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
 async def check_bot_token(token: str) -> tuple[bool, Optional[str]]:
     """Проверка валидности токена бота"""
     try:
@@ -145,14 +170,7 @@ async def check_bot_token(token: str) -> tuple[bool, Optional[str]]:
         logger.error(f"Ошибка проверки токена: {e}")
         return False, None
 
-def create_user_bot_instance(token: str) -> Bot:
-    """Создание экземпляра бота пользователя"""
-    return Bot(
-        token=token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
-
-# ========== КЛАВИАТУРЫ ==========
+# ========== КЛАВИАТУРЫ ДЛЯ ОСНОВНОГО БОТА ==========
 def get_main_keyboard():
     """Главное меню управления ботом"""
     return InlineKeyboardMarkup(
@@ -222,10 +240,10 @@ def get_buttons_management_keyboard():
         ]
     )
 
-# ========== ОБРАБОТЧИКИ КОМАНД ==========
-@router.message(CommandStart())
+# ========== ОБРАБОТЧИКИ ОСНОВНОГО БОТА ==========
+@main_router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    """Обработчик команды /start"""
+    """Обработчик команды /start для основного бота"""
     user_id = message.from_user.id
     await save_user(user_id)
     
@@ -248,7 +266,7 @@ async def cmd_start(message: Message, state: FSMContext):
         # Устанавливаем состояние ожидания токена
         await state.set_state(BotConstructorStates.waiting_for_token)
 
-@router.message(Command("help"))
+@main_router.message(Command("help"))
 async def cmd_help(message: Message):
     """Обработчик команды /help"""
     help_text = (
@@ -262,13 +280,12 @@ async def cmd_help(message: Message):
     )
     await message.answer(help_text)
 
-# ========== ОБРАБОТЧИКИ СОСТОЯНИЙ ==========
-@router.message(BotConstructorStates.waiting_for_token)
+@main_router.message(BotConstructorStates.waiting_for_token)
 async def process_token(message: Message, state: FSMContext):
     """Обработка ввода токена бота"""
     token = message.text.strip()
     
-    # Проверяем формат токена (примерная проверка)
+    # Проверяем формат токена
     if not token.startswith("") or ":" not in token:
         await message.answer(
             "❌ <b>Неверный формат токена!</b>\n\n"
@@ -289,12 +306,15 @@ async def process_token(message: Message, state: FSMContext):
         user_id = message.from_user.id
         await save_bot_token(user_id, token, bot_username)
         
+        # Запускаем пользовательского бота
+        await start_user_bot(token)
+        
         # Сбрасываем состояние
         await state.clear()
         
         # Обновляем сообщение
         await wait_msg.edit_text(
-            f"✅ <b>Токен успешно проверен!</b>\n\n"
+            f"✅ <b>Токен успешно проверен и бот запущен!</b>\n\n"
             f"Бот: @{bot_username}\n"
             f"Теперь вы можете настроить вашего бота.",
             reply_markup=get_main_keyboard()
@@ -306,7 +326,7 @@ async def process_token(message: Message, state: FSMContext):
             "<i>Отправьте токен бота:</i>"
         )
 
-@router.message(BotConstructorStates.waiting_for_greeting)
+@main_router.message(BotConstructorStates.waiting_for_greeting)
 async def process_greeting(message: Message, state: FSMContext):
     """Обработка ввода приветственного сообщения"""
     greeting_text = message.text
@@ -322,7 +342,7 @@ async def process_greeting(message: Message, state: FSMContext):
         reply_markup=get_main_keyboard()
     )
 
-@router.message(BotConstructorStates.waiting_button_text)
+@main_router.message(BotConstructorStates.waiting_button_text)
 async def process_button_text(message: Message, state: FSMContext):
     """Обработка ввода текста кнопки"""
     button_text = message.text
@@ -339,7 +359,7 @@ async def process_button_text(message: Message, state: FSMContext):
         reply_markup=get_cancel_keyboard()
     )
 
-@router.message(BotConstructorStates.waiting_button_url)
+@main_router.message(BotConstructorStates.waiting_button_url)
 async def process_button_url(message: Message, state: FSMContext):
     """Обработка ввода URL кнопки"""
     url = message.text
@@ -391,8 +411,8 @@ async def process_button_url(message: Message, state: FSMContext):
             reply_markup=get_main_keyboard()
         )
 
-# ========== ОБРАБОТЧИКИ CALLBACK-ЗАПРОСОВ ==========
-@router.callback_query(F.data == "edit_greeting")
+# ========== CALLBACK ОБРАБОТЧИКИ ОСНОВНОГО БОТА ==========
+@main_router.callback_query(F.data == "edit_greeting")
 async def edit_greeting_callback(callback: CallbackQuery, state: FSMContext):
     """Обработчик нажатия кнопки изменения приветствия"""
     user_bot = await get_user_bot(callback.from_user.id)
@@ -413,7 +433,7 @@ async def edit_greeting_callback(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BotConstructorStates.waiting_for_greeting)
     await callback.answer()
 
-@router.callback_query(F.data == "edit_buttons")
+@main_router.callback_query(F.data == "edit_buttons")
 async def edit_buttons_callback(callback: CallbackQuery):
     """Обработчик нажатия кнопки редактирования кнопок"""
     user_bot = await get_user_bot(callback.from_user.id)
@@ -436,7 +456,7 @@ async def edit_buttons_callback(callback: CallbackQuery):
     )
     await callback.answer()
 
-@router.callback_query(F.data == "bot_status")
+@main_router.callback_query(F.data == "bot_status")
 async def bot_status_callback(callback: CallbackQuery):
     """Обработчик нажатия кнопки статуса бота"""
     user_bot = await get_user_bot(callback.from_user.id)
@@ -449,14 +469,17 @@ async def bot_status_callback(callback: CallbackQuery):
     token = user_bot['bot_token']
     is_valid, bot_username = await check_bot_token(token)
     
+    bot_running = token in active_tokens
+    
     if is_valid:
-        status = "🟢 <b>Активен</b>"
-        status_details = f"Бот @{bot_username} работает нормально"
+        status = "🟢 <b>Активен</b>" if bot_running else "🟡 <b>Токен валиден, но бот не запущен</b>"
+        status_details = f"Бот @{bot_username} {'работает нормально' if bot_running else 'требует запуска'}"
     else:
         status = "🔴 <b>Неактивен</b>"
         status_details = "Токен недействителен. Проверьте токен бота."
     
     created_at = datetime.fromisoformat(user_bot['created_at'])
+    buttons = json.loads(user_bot.get('buttons_json', '[]'))
     
     await callback.message.edit_text(
         f"📊 <b>Статус вашего бота</b>\n\n"
@@ -465,13 +488,14 @@ async def bot_status_callback(callback: CallbackQuery):
         f"<b>Информация:</b>\n"
         f"• Токен сохранен: {created_at.strftime('%d.%m.%Y %H:%M')}\n"
         f"• Приветствие: {len(user_bot['greeting_text'])} символов\n"
-        f"• Кнопок: {len(json.loads(user_bot['buttons_json']))}\n\n"
+        f"• Кнопок: {len(buttons)}\n"
+        f"• Бот запущен: {'✅ Да' if bot_running else '❌ Нет'}\n\n"
         f"<i>Статус проверен: {datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
         reply_markup=get_main_keyboard()
     )
     await callback.answer()
 
-@router.callback_query(F.data == "change_token")
+@main_router.callback_query(F.data == "change_token")
 async def change_token_callback(callback: CallbackQuery, state: FSMContext):
     """Обработчик нажатия кнопки смены токена"""
     await callback.message.edit_text(
@@ -484,7 +508,7 @@ async def change_token_callback(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BotConstructorStates.waiting_for_token)
     await callback.answer()
 
-@router.callback_query(F.data == "add_button")
+@main_router.callback_query(F.data == "add_button")
 async def add_button_callback(callback: CallbackQuery, state: FSMContext):
     """Обработчик добавления новой кнопки"""
     await callback.message.edit_text(
@@ -497,7 +521,7 @@ async def add_button_callback(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BotConstructorStates.waiting_button_text)
     await callback.answer()
 
-@router.callback_query(F.data == "clear_buttons")
+@main_router.callback_query(F.data == "clear_buttons")
 async def clear_buttons_callback(callback: CallbackQuery):
     """Обработчик очистки всех кнопок"""
     user_id = callback.from_user.id
@@ -512,7 +536,7 @@ async def clear_buttons_callback(callback: CallbackQuery):
     )
     await callback.answer()
 
-@router.callback_query(F.data == "back_to_menu")
+@main_router.callback_query(F.data == "back_to_menu")
 async def back_to_menu_callback(callback: CallbackQuery):
     """Обработчик возврата в главное меню"""
     user_bot = await get_user_bot(callback.from_user.id)
@@ -531,7 +555,7 @@ async def back_to_menu_callback(callback: CallbackQuery):
         )
     await callback.answer()
 
-@router.callback_query(F.data == "cancel")
+@main_router.callback_query(F.data == "cancel")
 async def cancel_callback(callback: CallbackQuery, state: FSMContext):
     """Обработчик отмены действия"""
     await state.clear()
@@ -552,10 +576,139 @@ async def cancel_callback(callback: CallbackQuery, state: FSMContext):
     
     await callback.answer()
 
+# ========== ПОЛЬЗОВАТЕЛЬСКИЕ БОТЫ ==========
+async def create_user_bot_handlers(token: str):
+    """Создание обработчиков для пользовательского бота"""
+    router = Router()
+    
+    @router.message(CommandStart())
+    async def user_bot_start(message: Message):
+        """Обработчик команды /start для пользовательского бота"""
+        # Получаем настройки бота из БД
+        bot_settings = await get_bot_by_token(token)
+        
+        if not bot_settings:
+            await message.answer("Бот временно недоступен. Настройки не найдены.")
+            return
+        
+        greeting_text = bot_settings.get('greeting_text', 'Привет! Я ваш бот.')
+        buttons_json = bot_settings.get('buttons_json', '[]')
+        
+        try:
+            buttons = json.loads(buttons_json)
+        except:
+            buttons = []
+        
+        # Создаем клавиатуру с кнопками
+        if buttons:
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text=b['text'], url=b['url'])]
+                    for b in buttons
+                ]
+            )
+            await message.answer(greeting_text, reply_markup=keyboard)
+        else:
+            await message.answer(greeting_text)
+    
+    @router.message()
+    async def user_bot_echo(message: Message):
+        """Эхо-обработчик для пользовательского бота"""
+        await message.answer("Я бот, созданный через конструктор. Используйте /start")
+    
+    return router
+
+async def start_user_bot(token: str):
+    """Запуск пользовательского бота"""
+    try:
+        # Проверяем, не запущен ли уже бот с этим токеном
+        if token in active_tokens:
+            logger.info(f"Бот с токеном {token[:10]}... уже запущен")
+            return
+        
+        # Проверяем валидность токена
+        is_valid, bot_username = await check_bot_token(token)
+        if not is_valid:
+            logger.error(f"Невалидный токен: {token[:10]}...")
+            return
+        
+        # Создаем экземпляр бота
+        user_bot = Bot(
+            token=token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        )
+        
+        # Создаем диспетчер для этого бота
+        user_dp = Dispatcher(storage=MemoryStorage())
+        
+        # Создаем и добавляем обработчики
+        user_router = await create_user_bot_handlers(token)
+        user_dp.include_router(user_router)
+        
+        # Сохраняем в глобальные переменные
+        user_bots[token] = user_bot
+        user_dp_dict[token] = user_dp
+        active_tokens.add(token)
+        
+        # Запускаем поллинг в фоне
+        asyncio.create_task(run_user_bot_polling(user_bot, user_dp, token))
+        
+        logger.info(f"Запущен пользовательский бот: @{bot_username}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка запуска пользовательского бота: {e}")
+
+async def run_user_bot_polling(bot: Bot, dp: Dispatcher, token: str):
+    """Запуск поллинга для пользовательского бота"""
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Ошибка поллинга для бота {token[:10]}...: {e}")
+    finally:
+        # Удаляем бота из активных при остановке
+        if token in active_tokens:
+            active_tokens.remove(token)
+        if token in user_bots:
+            del user_bots[token]
+        if token in user_dp_dict:
+            del user_dp_dict[token]
+
+async def stop_user_bot(token: str):
+    """Остановка пользовательского бота"""
+    if token in user_dp_dict:
+        user_dp = user_dp_dict[token]
+        await user_dp.stop_polling()
+        
+        if token in active_tokens:
+            active_tokens.remove(token)
+        if token in user_bots:
+            del user_bots[token]
+        if token in user_dp_dict:
+            del user_dp_dict[token]
+        
+        logger.info(f"Остановлен пользовательский бот с токеном {token[:10]}...")
+
+async def start_all_user_bots():
+    """Запуск всех пользовательских ботов из БД"""
+    bots = await get_all_active_bots()
+    
+    tasks = []
+    for bot_data in bots:
+        token = bot_data.get('bot_token')
+        if token:
+            tasks.append(start_user_bot(token))
+    
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info(f"Запущено {len(tasks)} пользовательских ботов")
+    else:
+        logger.info("Нет пользовательских ботов для запуска")
+
 # ========== ВЕБ-СЕРВЕР ДЛЯ RENDER ==========
 async def health_check(request):
     """Проверка здоровья сервиса"""
-    return web.Response(text="Bot constructor is running!")
+    return web.Response(text=f"Bot constructor is running! Active bots: {len(active_tokens)}")
 
 async def web_server():
     """Запуск веб-сервера для поддержания активности на Render"""
@@ -572,9 +725,6 @@ async def web_server():
     logger.info(f"Web server started on port {PORT}")
     await site.start()
 
-    # Запускаем сервер на неопределенное время
-    await asyncio.Event().wait()
-
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 async def main():
     """Основная функция запуска бота"""
@@ -583,17 +733,24 @@ async def main():
     # Инициализация базы данных
     await init_db()
     
-    # Запуск веб-сервера в отдельной задаче
+    # Запуск веб-сервера в фоне
     web_server_task = asyncio.create_task(web_server())
     
+    # Запуск всех пользовательских ботов из БД
+    await start_all_user_bots()
+    
     try:
-        # Запуск бота
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        # Запуск основного бота (конструктора)
+        await main_bot.delete_webhook(drop_pending_updates=True)
+        await main_dp.start_polling(main_bot)
     except Exception as e:
-        logger.error(f"Ошибка при запуске бота: {e}")
+        logger.error(f"Ошибка при запуске основного бота: {e}")
     finally:
-        # Отмена задачи веб-сервера при завершении
+        # Остановка всех пользовательских ботов
+        for token in list(active_tokens):
+            await stop_user_bot(token)
+        
+        # Отмена задачи веб-сервера
         web_server_task.cancel()
         try:
             await web_server_task
