@@ -18,10 +18,18 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ========== CONFIG ==========
+# ========== КОНФИГУРАЦИЯ (может быть переопределена при регистрации) ==========
 CHANNEL_ID = os.getenv("CHANNEL_ID", "-1003326584722")
 WITHDRAWAL_CHANNEL_ID = os.getenv("WITHDRAWAL_CHANNEL", "-1003891414947")
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@Nft_top3")
+PORT = int(os.environ.get("PORT", 10000))
+
+REF_REWARD = 5.0
+VIEW_REWARD = 0.3
+DAILY_MIN, DAILY_MAX = 1, 3
+LUCK_MIN, LUCK_MAX = 0, 5
+LUCK_COOLDOWN = 6 * 60 * 60
+WITHDRAWAL_OPTIONS = [15, 25, 50, 100]
 
 GIFTS_PRICES = {
     "🧸 Мишка": 45, "❤️ Сердце": 45,
@@ -36,22 +44,12 @@ SPECIAL_ITEMS = {
     "Calendar": {"price": 320, "limit": 18, "full_name": "🗓 Desk Calendar"}
 }
 
-class AdminStates(StatesGroup):
-    waiting_fake_name = State()
-    waiting_give_data = State()
-    waiting_broadcast_msg = State()
-    waiting_channel_post = State()
-    waiting_promo_data = State()
+ITEMS_PER_PAGE = 5
 
-class PromoStates(StatesGroup):
-    waiting_for_code = State()
-
-class P2PSaleStates(StatesGroup):
-    waiting_for_price = State()
-
+# ========== КЛАСС ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ШАБЛОНА ==========
 class TemplateDatabase:
     def __init__(self, bot_id: int):
-        self.db_path = f"stars_{bot_id}.db"
+        self.db_path = f"stars_template_{bot_id}.db"
         self.init_db()
 
     def get_connection(self):
@@ -61,33 +59,77 @@ class TemplateDatabase:
 
     def init_db(self):
         with self.get_connection() as conn:
-            conn.execute("""CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-                stars REAL DEFAULT 0, referrals INTEGER DEFAULT 0,
-                last_daily TEXT, last_luck TEXT, ref_code TEXT UNIQUE,
-                ref_boost REAL DEFAULT 1.0, is_active INTEGER DEFAULT 0,
-                total_earned REAL DEFAULT 0, referred_by INTEGER
+            conn.execute("DROP TABLE IF EXISTS marketplace")
+            conn.execute("""CREATE TABLE IF NOT EXISTS marketplace (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                seller_id INTEGER,
+                item_name TEXT,
+                price REAL
             )""")
-            conn.execute("CREATE TABLE IF NOT EXISTS inventory (user_id INTEGER, item_name TEXT, quantity INTEGER DEFAULT 1, PRIMARY KEY(user_id, item_name))")
-            conn.execute("CREATE TABLE IF NOT EXISTS marketplace (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER, item_name TEXT, price REAL)")
-            conn.execute("CREATE TABLE IF NOT EXISTS lottery (id INTEGER PRIMARY KEY, pool REAL DEFAULT 0, participants TEXT DEFAULT '')")
+
+            conn.execute("""CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                stars REAL DEFAULT 0,
+                referrals INTEGER DEFAULT 0,
+                last_daily TIMESTAMP,
+                last_luck TIMESTAMP,
+                ref_code TEXT UNIQUE,
+                ref_boost REAL DEFAULT 1.0,
+                is_active INTEGER DEFAULT 0,
+                total_earned REAL DEFAULT 0,
+                referred_by INTEGER
+            )""")
+
+            conn.execute("""CREATE TABLE IF NOT EXISTS inventory (
+                user_id INTEGER,
+                item_name TEXT,
+                quantity INTEGER DEFAULT 1,
+                PRIMARY KEY(user_id, item_name)
+            )""")
+
+            conn.execute("""CREATE TABLE IF NOT EXISTS lottery (
+                id INTEGER PRIMARY KEY,
+                pool REAL DEFAULT 0,
+                participants TEXT DEFAULT ''
+            )""")
             conn.execute("INSERT OR IGNORE INTO lottery (id, pool, participants) VALUES (1, 0, '')")
-            conn.execute("CREATE TABLE IF NOT EXISTS promo (code TEXT PRIMARY KEY, reward_type TEXT, reward_value TEXT, uses INTEGER)")
-            conn.execute("CREATE TABLE IF NOT EXISTS promo_history (user_id INTEGER, code TEXT, PRIMARY KEY(user_id, code))")
-            conn.execute("CREATE TABLE IF NOT EXISTS task_claims (user_id INTEGER, task_id TEXT, PRIMARY KEY(user_id, task_id))")
-            conn.execute("CREATE TABLE IF NOT EXISTS daily_bonus (user_id INTEGER PRIMARY KEY, last_date TEXT, streak INTEGER DEFAULT 0)")
-            conn.commit()
 
-    def get_user(self, user_id: int):
-        with self.get_connection() as conn:
-            return conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            conn.execute("""CREATE TABLE IF NOT EXISTS lottery_history (
+                user_id INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )""")
 
-    def add_stars(self, user_id, amount):
-        with self.get_connection() as conn:
-            user = self.get_user(user_id)
-            boost = user['ref_boost'] if user else 1.0
-            final_amount = float(amount) * boost if amount > 0 else float(amount)
-            conn.execute("UPDATE users SET stars = stars + ? WHERE user_id = ?", (final_amount, user_id))
+            conn.execute("""CREATE TABLE IF NOT EXISTS task_claims (
+                user_id INTEGER,
+                task_id TEXT,
+                PRIMARY KEY(user_id, task_id)
+            )""")
+
+            conn.execute("""CREATE TABLE IF NOT EXISTS promo (
+                code TEXT PRIMARY KEY,
+                reward_type TEXT,
+                reward_value TEXT,
+                uses INTEGER
+            )""")
+
+            conn.execute("""CREATE TABLE IF NOT EXISTS promo_history (
+                user_id INTEGER,
+                code TEXT,
+                PRIMARY KEY(user_id, code)
+            )""")
+
+            conn.execute("""CREATE TABLE IF NOT EXISTS daily_bonus (
+                user_id INTEGER PRIMARY KEY,
+                last_date TEXT,
+                streak INTEGER DEFAULT 0
+            )""")
+
+            conn.execute("""CREATE TABLE IF NOT EXISTS active_duels (
+                creator_id INTEGER PRIMARY KEY,
+                amount REAL
+            )""")
             conn.commit()
 
     def get_user(self, user_id: int):
