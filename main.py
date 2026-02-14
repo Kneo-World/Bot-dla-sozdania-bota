@@ -2,16 +2,18 @@ import os
 import json
 import logging
 import asyncio
+import random
 import re
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Set, Any
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
-    Message, CallbackQuery, 
-    InlineKeyboardMarkup, InlineKeyboardButton
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ChatMemberUpdated, FSInputFile
 )
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -22,24 +24,34 @@ import aiosqlite
 import aiohttp
 from aiohttp import web
 
-# ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+# ========== ПОДКЛЮЧЕНИЕ ШАБЛОНА ==========
+# Импортируем функции из готового шаблона (файл template_stars.py)
+try:
+    from template_stars import register_template_handlers, run_template_logic
+    TEMPLATE_AVAILABLE = True
+except ImportError:
+    TEMPLATE_AVAILABLE = False
+    logging.warning("Шаблон StarsForQuestion не найден. Шаблонные боты работать не будут.")
 
-# ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
+# ========== КОНФИГУРАЦИЯ ==========
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не установлен в переменных окружения")
 
 PORT = int(os.getenv('PORT', 10000))
+ADMIN_ID = int(os.getenv('ADMIN_ID', '8364667153'))  # Основной админ @Nft_top3
+SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', '@Nft_top3')
+WITHDRAWAL_CHANNEL = os.getenv('WITHDRAWAL_CHANNEL', '-1003891414947')
+CHANNEL_ID = os.getenv('CHANNEL_ID', '-1003326584722')
+
+# Экономика
+DAILY_MIN, DAILY_MAX = 5, 10  # Кнетки за ежедневный бонус
+REF_REWARD = 5                 # Бонус за реферала
+ROYALTY_PERCENT = 20           # % автору шаблона при продаже
 
 # ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
-user_bots: Dict[str, Tuple[Bot, Dispatcher, asyncio.Task]] = {}  # token -> (Bot, Dispatcher, Task)
+user_bots: Dict[str, Tuple[Bot, Dispatcher, asyncio.Task]] = {}  # токен -> (бот, диспетчер, задача)
 WATERMARK_MESSAGE = "⚒️ Бот создан с помощью @KneoFreeBot"
-WATERMARK_IN_TEXT = "⚒️ Бот создан с помощью @KneoFreeBot\n\n"
 
 # ========== ОСНОВНОЙ БОТ И ДИСПЕТЧЕР ==========
 main_bot = Bot(
@@ -51,7 +63,7 @@ main_router = Router()
 main_dp.include_router(main_router)
 
 # ========== СОСТОЯНИЯ FSM ==========
-class BotConstructorStates(StatesGroup):
+class ConstructorStates(StatesGroup):
     waiting_for_token = State()
     waiting_scene_name = State()
     waiting_scene_message = State()
@@ -60,24 +72,46 @@ class BotConstructorStates(StatesGroup):
     waiting_button_text = State()
     waiting_button_url = State()
     waiting_button_target_scene = State()
-    waiting_variable_action = State()
+    waiting_variable_name = State()
+    waiting_variable_operation = State()
     waiting_variable_value = State()
-    editing_scene = State()
-    waiting_new_message = State()
+    waiting_template_purchase = State()
+    waiting_promo_code = State()
+    waiting_broadcast = State()
+    waiting_give_kn = State()
+    waiting_moderate_template = State()
 
 # ========== БАЗА ДАННЫХ ==========
 async def init_db():
-    """Инициализация базы данных"""
-    async with aiosqlite.connect('database.db') as db:
-        # Таблица для пользователей конструктора
+    async with aiosqlite.connect('kneo.db') as db:
+        # Пользователи конструктора
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                kn_balance REAL DEFAULT 0,
+                last_daily TIMESTAMP,
+                ref_code TEXT UNIQUE,
+                referred_by INTEGER,
+                total_earned REAL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # Таблица для ботов пользователей
+        # Транзакции
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                type TEXT,
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Боты пользователей
         await db.execute('''
             CREATE TABLE IF NOT EXISTS user_bots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,1678 +119,667 @@ async def init_db():
                 bot_token TEXT UNIQUE,
                 bot_username TEXT,
                 is_active BOOLEAN DEFAULT 1,
-                start_scene TEXT DEFAULT 'start',
+                is_template BOOLEAN DEFAULT 0,
+                template_author INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (user_id)
             )
         ''')
         
-        # Таблица для сцен
+        # Сцены (для кастомных ботов)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS scenes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bot_id INTEGER,
                 name TEXT,
-                messages_json TEXT DEFAULT '[]',  -- JSON список сообщений
-                buttons_json TEXT DEFAULT '[]',   -- Кнопки для последнего сообщения
+                messages_json TEXT DEFAULT '[]',
+                buttons_json TEXT DEFAULT '[]',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(bot_id, name),
                 FOREIGN KEY (bot_id) REFERENCES user_bots (id)
             )
         ''')
         
-        # Таблица для переменных пользователей
+        # Переменные пользователей (для кастомных ботов)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS user_vars (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bot_id INTEGER,
                 user_id INTEGER,
-                var_name TEXT DEFAULT 'stars',
-                var_value INTEGER DEFAULT 0,
+                var_name TEXT,
+                var_value TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(bot_id, user_id, var_name),
                 FOREIGN KEY (bot_id) REFERENCES user_bots (id)
             )
         ''')
         
-        await db.commit()
-        logger.info("База данных инициализирована")
-
-async def save_user(user_id: int):
-    """Сохранение пользователя в БД"""
-    async with aiosqlite.connect('database.db') as db:
-        await db.execute(
-            'INSERT OR IGNORE INTO users (user_id) VALUES (?)',
-            (user_id,)
-        )
-        await db.commit()
-
-async def save_bot_token(user_id: int, token: str, bot_username: str):
-    """Сохранение токена бота пользователя"""
-    async with aiosqlite.connect('database.db') as db:
-        # Удаляем старый токен, если есть
-        await db.execute(
-            'DELETE FROM user_bots WHERE user_id = ?',
-            (user_id,)
-        )
-        
-        # Сохраняем новый
+        # Алиасы переменных
         await db.execute('''
-            INSERT INTO user_bots (user_id, bot_token, bot_username, start_scene)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, token, bot_username, 'start'))
+            CREATE TABLE IF NOT EXISTS var_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id INTEGER,
+                var_name TEXT,
+                alias_order INTEGER,
+                alias_display TEXT,
+                UNIQUE(bot_id, var_name, alias_order),
+                UNIQUE(bot_id, var_name, alias_display),
+                FOREIGN KEY (bot_id) REFERENCES user_bots (id)
+            )
+        ''')
+        
+        # Магазин шаблонов
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                author_id INTEGER,
+                name TEXT,
+                description TEXT,
+                price REAL,
+                file_path TEXT,
+                is_approved BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (author_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        # Покупки шаблонов
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS template_purchases (
+                user_id INTEGER,
+                template_id INTEGER,
+                purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id),
+                FOREIGN KEY (template_id) REFERENCES templates (id)
+            )
+        ''')
+        
+        # Промокоды
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS promos (
+                code TEXT PRIMARY KEY,
+                amount REAL,
+                uses_left INTEGER,
+                created_by INTEGER
+            )
+        ''')
+        
+        # Использования промокодов
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS promo_uses (
+                user_id INTEGER,
+                code TEXT,
+                used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, code)
+            )
+        ''')
         
         await db.commit()
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+async def get_user(user_id: int) -> Optional[Dict]:
+    async with aiosqlite.connect('kneo.db') as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+async def create_user(user_id: int, username: str, first_name: str, ref_by: int = None):
+    async with aiosqlite.connect('kneo.db') as db:
+        ref_code = f"ref{user_id}"
+        await db.execute('''
+            INSERT OR IGNORE INTO users (user_id, username, first_name, ref_code, referred_by)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, username, first_name, ref_code, ref_by))
+        await db.commit()
+
+async def add_kn(user_id: int, amount: float, description: str = ''):
+    async with aiosqlite.connect('kneo.db') as db:
+        await db.execute('UPDATE users SET kn_balance = kn_balance + ? WHERE user_id = ?', (amount, user_id))
+        await db.execute('''
+            INSERT INTO transactions (user_id, amount, type, description)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, amount, 'credit' if amount > 0 else 'debit', description))
+        await db.commit()
+
+async def deduct_kn(user_id: int, amount: float, description: str):
+    await add_kn(user_id, -amount, description)
 
 async def get_user_bot(user_id: int) -> Optional[Dict]:
-    """Получение информации о боте пользователя"""
-    async with aiosqlite.connect('database.db') as db:
+    async with aiosqlite.connect('kneo.db') as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute('''
-            SELECT * FROM user_bots WHERE user_id = ?
+            SELECT * FROM user_bots WHERE user_id = ? ORDER BY id DESC LIMIT 1
         ''', (user_id,))
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-async def get_bot_by_token(token: str) -> Optional[Dict]:
-    """Получение настроек бота по токену"""
-    async with aiosqlite.connect('database.db') as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute('''
-            SELECT * FROM user_bots WHERE bot_token = ?
-        ''', (token,))
-        row = await cursor.fetchone()
-        return dict(row) if row else None
-
-async def get_bot_scenes(bot_id: int) -> List[Dict]:
-    """Получение всех сцен бота"""
-    async with aiosqlite.connect('database.db') as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute('''
-            SELECT * FROM scenes WHERE bot_id = ? ORDER BY created_at
-        ''', (bot_id,))
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
-
-async def get_scene(bot_id: int, scene_name: str) -> Optional[Dict]:
-    """Получение конкретной сцены"""
-    async with aiosqlite.connect('database.db') as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute('''
-            SELECT * FROM scenes WHERE bot_id = ? AND name = ?
-        ''', (bot_id, scene_name))
-        row = await cursor.fetchone()
-        return dict(row) if row else None
-
-async def save_scene(bot_id: int, scene_name: str, messages: List[str], buttons: List[Dict] = None):
-    """Сохранение сцены"""
-    messages_json = json.dumps(messages, ensure_ascii=False)
-    buttons_json = json.dumps(buttons if buttons else [], ensure_ascii=False)
-    
-    async with aiosqlite.connect('database.db') as db:
+async def save_bot_token(user_id: int, token: str, bot_username: str, is_template: bool = False, author_id: int = None):
+    async with aiosqlite.connect('kneo.db') as db:
         await db.execute('''
-            INSERT OR REPLACE INTO scenes (bot_id, name, messages_json, buttons_json)
-            VALUES (?, ?, ?, ?)
-        ''', (bot_id, scene_name, messages_json, buttons_json))
+            INSERT INTO user_bots (user_id, bot_token, bot_username, is_template, template_author)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, token, bot_username, 1 if is_template else 0, author_id))
         await db.commit()
-
-async def update_scene_messages(bot_id: int, scene_name: str, messages: List[str]):
-    """Обновление сообщений сцены"""
-    messages_json = json.dumps(messages, ensure_ascii=False)
-    async with aiosqlite.connect('database.db') as db:
-        await db.execute('''
-            UPDATE scenes SET messages_json = ? WHERE bot_id = ? AND name = ?
-        ''', (messages_json, bot_id, scene_name))
-        await db.commit()
-
-async def update_scene_buttons(bot_id: int, scene_name: str, buttons: List[Dict]):
-    """Обновление кнопок сцены"""
-    buttons_json = json.dumps(buttons, ensure_ascii=False)
-    async with aiosqlite.connect('database.db') as db:
-        await db.execute('''
-            UPDATE scenes SET buttons_json = ? WHERE bot_id = ? AND name = ?
-        ''', (buttons_json, bot_id, scene_name))
-        await db.commit()
-
-async def delete_scene(bot_id: int, scene_name: str):
-    """Удаление сцены"""
-    async with aiosqlite.connect('database.db') as db:
-        await db.execute('''
-            DELETE FROM scenes WHERE bot_id = ? AND name = ?
-        ''', (bot_id, scene_name))
-        await db.commit()
-
-async def set_bot_active_status(bot_id: int, is_active: bool):
-    """Установка статуса активности бота"""
-    async with aiosqlite.connect('database.db') as db:
-        await db.execute('''
-            UPDATE user_bots SET is_active = ? WHERE id = ?
-        ''', (1 if is_active else 0, bot_id))
-        await db.commit()
-
-async def get_all_active_bots() -> List[Dict]:
-    """Получение всех активных ботов из БД"""
-    async with aiosqlite.connect('database.db') as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute('''
-            SELECT * FROM user_bots WHERE is_active = 1
-        ''')
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
 
 async def check_bot_token(token: str) -> Tuple[bool, Optional[str]]:
-    """Проверка валидности токена бота"""
     try:
         temp_bot = Bot(token=token)
-        bot_info = await temp_bot.get_me()
+        me = await temp_bot.get_me()
         await temp_bot.session.close()
-        return True, bot_info.username
-    except Exception as e:
-        logger.error(f"Ошибка проверки токена: {e}")
+        return True, me.username
+    except:
         return False, None
 
-async def get_user_variable(bot_id: int, user_id: int, var_name: str = "stars") -> int:
-    """Получение значения переменной пользователя"""
-    async with aiosqlite.connect('database.db') as db:
+# ========== ФУНКЦИИ ДЛЯ РАБОТЫ С ПЕРЕМЕННЫМИ В КАСТОМНЫХ БОТАХ ==========
+async def get_user_var(bot_id: int, user_id: int, var_name: str) -> str:
+    async with aiosqlite.connect('kneo.db') as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute('''
-            SELECT var_value FROM user_vars 
-            WHERE bot_id = ? AND user_id = ? AND var_name = ?
+        cur = await db.execute('''
+            SELECT var_value FROM user_vars WHERE bot_id = ? AND user_id = ? AND var_name = ?
         ''', (bot_id, user_id, var_name))
-        row = await cursor.fetchone()
+        row = await cur.fetchone()
         if row:
             return row['var_value']
         else:
-            # Если записи нет, создаем со значением по умолчанию 0
             await db.execute('''
                 INSERT INTO user_vars (bot_id, user_id, var_name, var_value)
                 VALUES (?, ?, ?, ?)
-            ''', (bot_id, user_id, var_name, 0))
+            ''', (bot_id, user_id, var_name, '0'))
             await db.commit()
-            return 0
+            return '0'
 
-async def update_user_variable(bot_id: int, user_id: int, var_name: str, new_value: int):
-    """Обновление значения переменной пользователя"""
-    async with aiosqlite.connect('database.db') as db:
+async def set_user_var(bot_id: int, user_id: int, var_name: str, value: str):
+    async with aiosqlite.connect('kneo.db') as db:
         await db.execute('''
             INSERT OR REPLACE INTO user_vars (bot_id, user_id, var_name, var_value)
             VALUES (?, ?, ?, ?)
-        ''', (bot_id, user_id, var_name, new_value))
+        ''', (bot_id, user_id, var_name, value))
         await db.commit()
 
-# ========== ФУНКЦИИ ДЛЯ РАБОТЫ С ПЛЕЙСХОЛДЕРАМИ ==========
-def parse_placeholders(text: str, user_data: Dict, stars_value: int = 0) -> str:
-    """
-    Замена плейсхолдеров в тексте на реальные значения
-    user_data должен содержать: id, first_name, username
-    """
-    replacements = {
-        '##stars##': str(stars_value),
-        '##name_user##': user_data.get('first_name', 'Пользователь'),
-        '##ID_user##': str(user_data.get('id', '')),
-        '##user_user##': f"@{user_data.get('username', '')}" if user_data.get('username') else user_data.get('first_name', 'Пользователь')
-    }
-    
-    result = text
-    for placeholder, value in replacements.items():
-        result = result.replace(placeholder, value)
-    
-    # Добавляем вотермарку в начало текста
-    if not result.startswith(WATERMARK_IN_TEXT.strip()):
-        result = WATERMARK_IN_TEXT + result
-    
-    return result
+async def modify_user_var(bot_id: int, user_id: int, var_name: str, op: str, operand: str) -> str:
+    # op: '==', '++', '--'
+    current = await get_user_var(bot_id, user_id, var_name)
+    try:
+        current_num = float(current)
+        operand_num = float(operand)
+        if op == '==':
+            new_val = operand
+        elif op == '++':
+            new_val = str(current_num + operand_num)
+        elif op == '--':
+            new_val = str(current_num - operand_num)
+        else:
+            new_val = current
+    except:
+        # Текстовые значения – поддерживаем только присваивание
+        if op == '==':
+            new_val = operand
+        else:
+            new_val = current
+    await set_user_var(bot_id, user_id, var_name, new_val)
+    return new_val
+
+async def get_scene(bot_id: int, scene_name: str) -> Optional[Dict]:
+    async with aiosqlite.connect('kneo.db') as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute('''
+            SELECT * FROM scenes WHERE bot_id = ? AND name = ?
+        ''', (bot_id, scene_name))
+        row = await cur.fetchone()
+        return dict(row) if row else None
 
 # ========== КЛАВИАТУРЫ ==========
-def get_main_keyboard():
-    """Главное меню управления ботом"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🆕 Создать сцену", callback_data="create_scene"),
-                InlineKeyboardButton(text="📋 Мои сцены", callback_data="my_scenes")
-            ],
-            [
-                InlineKeyboardButton(text="▶️ Запустить бота", callback_data="start_bot"),
-                InlineKeyboardButton(text="⏹ Остановить бота", callback_data="stop_bot")
-            ],
-            [
-                InlineKeyboardButton(text="📊 Статус", callback_data="bot_status"),
-                InlineKeyboardButton(text="❓ Помощь", callback_data="help")
-            ],
-            [
-                InlineKeyboardButton(text="🔄 Сменить токен", callback_data="change_token")
-            ]
-        ]
-    )
-
-def get_cancel_keyboard():
-    """Клавиатура с кнопкой отмены"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
-            ]
-        ]
-    )
-
-def get_content_type_keyboard():
-    """Клавиатура выбора типа контента (только текст)"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📝 Текст", callback_data="content_text")
-            ],
-            [
-                InlineKeyboardButton(text="🖼️ Фото", callback_data="content_photo_disabled"),
-                InlineKeyboardButton(text="🎥 Видео", callback_data="content_video_disabled")
-            ],
-            [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
-            ]
-        ]
-    )
-
-def get_scene_management_keyboard(scene_name: str = None):
-    """Клавиатура управления сценой"""
-    buttons = [
-        [
-            InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="add_button_to_scene")
-        ],
-        [
-            InlineKeyboardButton(text="➕ Добавить сообщение", callback_data="add_message_to_scene")
-        ],
-        [
-            InlineKeyboardButton(text="✅ Завершить сцену", callback_data="finish_scene")
-        ],
-        [
-            InlineKeyboardButton(text="❌ Удалить сцену", callback_data="delete_scene")
-        ],
-        [
-            InlineKeyboardButton(text="🔙 Назад к сценам", callback_data="back_to_scenes")
-        ]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_button_type_keyboard():
-    """Клавиатура выбора типа кнопки"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🔗 Ссылка (URL)", callback_data="button_type_url")
-            ],
-            [
-                InlineKeyboardButton(text="🔄 Переход на сцену", callback_data="button_type_scene")
-            ],
-            [
-                InlineKeyboardButton(text="⭐ Изменить переменную", callback_data="button_type_variable")
-            ],
-            [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
-            ]
-        ]
-    )
-
-def get_variable_action_keyboard():
-    """Клавиатура выбора действия с переменной"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="➕ Увеличить на 1", callback_data="var_action_plus_1"),
-                InlineKeyboardButton(text="➖ Уменьшить на 1", callback_data="var_action_minus_1")
-            ],
-            [
-                InlineKeyboardButton(text="✏️ Ввести значение", callback_data="var_action_set")
-            ],
-            [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
-            ]
-        ]
-    )
-
-def get_scenes_list_keyboard(scenes: List[Dict], current_page: int = 0, scenes_per_page: int = 5):
-    """Клавиатура со списком сцен"""
-    start_idx = current_page * scenes_per_page
-    end_idx = start_idx + scenes_per_page
-    
-    buttons = []
-    for scene in scenes[start_idx:end_idx]:
-        messages = json.loads(scene['messages_json'])
-        message_count = len(messages)
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"📄 {scene['name']} ({message_count} сообщ.)",
-                callback_data=f"scene_{scene['name']}"
-            )
-        ])
-    
-    # Кнопки навигации
-    nav_buttons = []
-    if current_page > 0:
-        nav_buttons.append(
-            InlineKeyboardButton(text="◀️ Назад", callback_data=f"page_{current_page-1}")
-        )
-    if end_idx < len(scenes):
-        nav_buttons.append(
-            InlineKeyboardButton(text="Вперед ▶️", callback_data=f"page_{current_page+1}")
-        )
-    
-    if nav_buttons:
-        buttons.append(nav_buttons)
-    
-    buttons.append([
-        InlineKeyboardButton(text="🆕 Создать сцену", callback_data="create_scene"),
-        InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")
+def main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
+         InlineKeyboardButton(text="🎁 Бонус", callback_data="daily_bonus")],
+        [InlineKeyboardButton(text="🛠️ Мои боты", callback_data="my_bots"),
+         InlineKeyboardButton(text="🏪 Магазин шаблонов", callback_data="template_shop")],
+        [InlineKeyboardButton(text="👥 Рефералы", callback_data="ref"),
+         InlineKeyboardButton(text="❓ Помощь", callback_data="help")],
+        [InlineKeyboardButton(text="👑 Админ панель", callback_data="admin_panel")]  # будет скрыто для не-админов
     ])
-    
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-def get_content_type_icon(content_type: str) -> str:
-    """Получение иконки для типа контента"""
-    icons = {
-        'text': '📝',
-        'photo': '🖼️',
-        'video': '🎥'
-    }
-    return icons.get(content_type, '📄')
+def cancel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
+    ])
 
 # ========== ОБРАБОТЧИКИ ОСНОВНОГО БОТА ==========
 @main_router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    """Обработчик команды /start для основного бота"""
     user_id = message.from_user.id
-    await save_user(user_id)
+    username = message.from_user.username or ''
+    first_name = message.from_user.first_name or ''
     
-    user_bot = await get_user_bot(user_id)
+    # Реферальная система
+    ref_by = None
+    if len(message.text.split()) > 1:
+        arg = message.text.split()[1]
+        if arg.startswith('ref'):
+            try:
+                ref_by = int(arg[3:])
+            except:
+                pass
     
-    if user_bot:
-        await message.answer(
-            "👋 Добро пожаловать в конструктор ботов с системой переменных!\n\n"
-            "Выберите действие:",
-            reply_markup=get_main_keyboard()
-        )
-    else:
-        await message.answer(
-            "🤖 <b>Добро пожаловать в конструктор Telegram-ботов!</b>\n\n"
-            "Для начала работы вам необходимо предоставить токен вашего бота.\n\n"
-            "<i>Отправьте токен бота, полученный от @BotFather:</i>"
-        )
-        await state.set_state(BotConstructorStates.waiting_for_token)
+    await create_user(user_id, username, first_name, ref_by)
+    if ref_by and ref_by != user_id:
+        await add_kn(ref_by, REF_REWARD, f"Реферал {user_id}")
+    
+    await message.answer(
+        f"👋 Добро пожаловать в <b>Kneo Bots | Создай бота бесплатно</b>!\n\n"
+        f"Твой баланс: {await get_kn_balance(user_id)} Кнеток",
+        reply_markup=main_keyboard()
+    )
+
+@main_router.callback_query(F.data == "profile")
+async def profile_callback(call: CallbackQuery):
+    user = await get_user(call.from_user.id)
+    await call.message.edit_text(
+        f"👤 <b>Профиль</b>\n\n"
+        f"ID: <code>{user['user_id']}</code>\n"
+        f"Имя: {user['first_name']}\n"
+        f"Баланс: {user['kn_balance']:.2f} Кнеток\n"
+        f"Рефералов: {await count_refs(user['user_id'])}\n"
+        f"Ссылка: https://t.me/{(await main_bot.get_me()).username}?start={user['ref_code']}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+        ])
+    )
+
+@main_router.callback_query(F.data == "daily_bonus")
+async def daily_bonus_callback(call: CallbackQuery):
+    user_id = call.from_user.id
+    now = datetime.now()
+    async with aiosqlite.connect('kneo.db') as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute('SELECT last_daily FROM users WHERE user_id = ?', (user_id,))
+        row = await cur.fetchone()
+        if row and row['last_daily']:
+            last = datetime.fromisoformat(row['last_daily'])
+            if (now - last).days < 1:
+                await call.answer("Ты уже получал бонус сегодня! Приходи завтра.", show_alert=True)
+                return
+        bonus = random.randint(DAILY_MIN, DAILY_MAX)
+        await db.execute('UPDATE users SET kn_balance = kn_balance + ?, last_daily = ? WHERE user_id = ?',
+                         (bonus, now.isoformat(), user_id))
+        await db.execute('INSERT INTO transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)',
+                         (user_id, bonus, 'credit', 'Ежедневный бонус'))
+        await db.commit()
+    await call.answer(f"🎁 +{bonus} Кнеток получено!", show_alert=True)
+    await profile_callback(call)
+
+@main_router.callback_query(F.data == "ref")
+async def ref_callback(call: CallbackQuery):
+    user = await get_user(call.from_user.id)
+    ref_link = f"https://t.me/{(await main_bot.get_me()).username}?start={user['ref_code']}"
+    await call.message.edit_text(
+        f"👥 <b>Реферальная система</b>\n\n"
+        f"За каждого приглашенного друга, который запустит бота, ты получаешь {REF_REWARD} Кнеток.\n\n"
+        f"Твоя ссылка:\n<code>{ref_link}</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+        ])
+    )
 
 @main_router.callback_query(F.data == "help")
-async def help_callback(callback: CallbackQuery):
-    """Обработчик кнопки помощи"""
-    await callback.answer()
-    
+async def help_callback(call: CallbackQuery):
     help_text = (
-        "📚 <b>Помощь по конструктору ботов</b>\n\n"
-        "<b>Как создавать сцены:</b>\n"
-        "1. Нажмите '🆕 Создать сцену'\n"
-        "2. Введите уникальное имя сцены (латинские буквы, без пробелов)\n"
-        "3. Введите текст сообщения\n"
-        "4. Можете добавить дополнительные сообщения в сцену\n"
-        "5. Добавьте кнопки к последнему сообщению\n\n"
-        
-        "<b>Типы кнопок:</b>\n"
-        "• 🔗 Ссылка (URL) - ведет на внешний сайт\n"
-        "• 🔄 Переход на сцену - меняет текущее сообщение\n"
-        "• ⭐ Изменить переменную - изменяет значение переменной ##stars##\n\n"
-        
-        "<b>Система переменных (плейсхолдеры):</b>\n"
-        "В тексте сообщений можно использовать:\n"
-        "• <code>##stars##</code> - количество звезд (изменяется через кнопки)\n"
-        "• <code>##name_user##</code> - имя пользователя\n"
-        "• <code>##ID_user##</code> - ID пользователя в Telegram\n"
-        "• <code>##user_user##</code> - username пользователя\n\n"
-        
-        "<b>Пример текста:</b>\n"
-        "<code>Привет, ##name_user##! У тебя ##stars## звезд.</code>\n\n"
-        
-        "<b>Вотермарка:</b>\n"
-        "При команде /start во всех созданных ботах автоматически отправляется сообщение с вотермаркой."
+        "📚 <b>Помощь по Kneo Bots</b>\n\n"
+        "• <b>Профиль</b> – твой баланс и реферальная ссылка.\n"
+        "• <b>Мои боты</b> – управление созданными ботами, добавление токена, настройка сцен.\n"
+        "• <b>Магазин шаблонов</b> – покупка готовых ботов за Кнетки. Автор получает 20% роялти.\n"
+        "• <b>Пополнение баланса</b> – свяжись с @Nft_top3 для покупки Кнеток.\n"
+        "• <b>Ежедневный бонус</b> – получай 5-10 Кнеток каждый день.\n"
+        "• <b>Промокоды</b> – активируй в разделе 'Профиль'.\n\n"
+        "Поддержка: @Nft_top3"
     )
-    
-    await callback.message.edit_text(
-        help_text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")]
-        ])
-    )
+    await call.message.edit_text(help_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+    ]))
 
-@main_router.message(BotConstructorStates.waiting_for_token)
+# ---------- Управление ботами ----------
+@main_router.callback_query(F.data == "my_bots")
+async def my_bots_callback(call: CallbackQuery):
+    user_id = call.from_user.id
+    async with aiosqlite.connect('kneo.db') as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT * FROM user_bots WHERE user_id = ? ORDER BY created_at DESC
+        ''', (user_id,))
+        bots = await cursor.fetchall()
+    if not bots:
+        text = "У тебя пока нет ботов. Добавь нового бота, отправив его токен (получи у @BotFather)."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+        ])
+    else:
+        text = "Твои боты:\n\n"
+        kb_buttons = []
+        for bot in bots:
+            status = "🟢 активен" if bot['is_active'] and bot['bot_token'] in user_bots else "🔴 остановлен"
+            text += f"• @{bot['bot_username']} – {status}\n"
+            kb_buttons.append([InlineKeyboardButton(text=f"⚙️ @{bot['bot_username']}", callback_data=f"edit_bot_{bot['id']}")])
+        kb_buttons.append([InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot")])
+        kb_buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")])
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    await call.message.edit_text(text, reply_markup=kb)
+
+@main_router.callback_query(F.data == "add_bot")
+async def add_bot_callback(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text(
+        "🤖 Отправь токен своего бота (получи у @BotFather).\n"
+        "Пример: 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz",
+        reply_markup=cancel_keyboard()
+    )
+    await state.set_state(ConstructorStates.waiting_for_token)
+
+@main_router.message(ConstructorStates.waiting_for_token)
 async def process_token(message: Message, state: FSMContext):
-    """Обработка ввода токена бота"""
     token = message.text.strip()
-    
-    if not token.startswith("") or ":" not in token:
-        await message.answer(
-            "❌ <b>Неверный формат токена!</b>\n\n"
-            "Попробуйте еще раз:"
-        )
+    if ':' not in token:
+        await message.answer("❌ Неверный формат токена. Попробуй снова.")
         return
-    
-    wait_msg = await message.answer("🔍 Проверяю токен...")
-    
-    is_valid, bot_username = await check_bot_token(token)
-    
-    if is_valid and bot_username:
+    wait = await message.answer("🔍 Проверяю токен...")
+    ok, username = await check_bot_token(token)
+    if ok and username:
         user_id = message.from_user.id
-        await save_bot_token(user_id, token, bot_username)
-        
-        # Создаем стартовую сцену
-        user_bot = await get_user_bot(user_id)
-        if user_bot:
-            await save_scene(user_bot['id'], 'start', ['Добро пожаловать! У тебя ##stars## звезд.'])
-        
+        await save_bot_token(user_id, token, username)
+        await wait.edit_text(f"✅ Бот @{username} добавлен! Теперь ты можешь настроить его сцены.")
         await state.clear()
-        
-        await wait_msg.edit_text(
-            f"✅ <b>Токен успешно проверен!</b>\n\n"
-            f"Бот: @{bot_username}\n\n"
-            f"Создана стартовая сцена 'start'. Вы можете ее отредактировать.",
-            reply_markup=get_main_keyboard()
-        )
     else:
-        await wait_msg.edit_text(
-            "❌ <b>Недействительный токен!</b>\n\n"
-            "Попробуйте еще раз:"
-        )
+        await wait.edit_text("❌ Недействительный токен. Проверь и попробуй ещё раз.")
 
-@main_router.callback_query(F.data == "create_scene")
-async def create_scene_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик создания новой сцены"""
-    await callback.answer()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    
-    if not user_bot:
-        await callback.message.answer("Сначала настройте бота!")
-        return
-    
-    await callback.message.edit_text(
-        "🆕 <b>Создание новой сцены</b>\n\n"
-        "Введите уникальное имя для сцены (на английском, без пробелов):\n"
-        "<i>Пример: main_menu, profile, shop</i>",
-        reply_markup=get_cancel_keyboard()
-    )
-    
-    await state.set_state(BotConstructorStates.waiting_scene_name)
-    await state.update_data(bot_id=user_bot['id'])
+# ---------- Магазин шаблонов ----------
+@main_router.callback_query(F.data == "template_shop")
+async def template_shop_callback(call: CallbackQuery):
+    async with aiosqlite.connect('kneo.db') as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT * FROM templates WHERE is_approved = 1 ORDER BY price
+        ''')
+        templates = await cursor.fetchall()
+    if not templates:
+        text = "🏪 В магазине пока нет одобренных шаблонов."
+    else:
+        text = "🏪 <b>Магазин шаблонов</b>\n\nВыбери шаблон для покупки:\n"
+    kb = InlineKeyboardBuilder()
+    for tmpl in templates:
+        kb.row(InlineKeyboardButton(
+            text=f"{tmpl['name']} — {tmpl['price']} KN",
+            callback_data=f"buy_template_{tmpl['id']}"
+        ))
+    kb.row(InlineKeyboardButton(text="🔙 Назад", callback_data="back_main"))
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
 
-@main_router.message(BotConstructorStates.waiting_scene_name)
-async def process_scene_name(message: Message, state: FSMContext):
-    """Обработка ввода имени сцены"""
-    scene_name = message.text.strip().lower()
-    
-    if not scene_name.isalnum() or ' ' in scene_name:
-        await message.answer(
-            "❌ <b>Некорректное имя сцены!</b>\n\n"
-            "Имя должно содержать только английские буквы и цифры, без пробелов.\n"
-            "Попробуйте еще раз:"
-        )
-        return
-    
-    data = await state.get_data()
-    bot_id = data['bot_id']
-    
-    # Проверяем, существует ли уже сцена с таким именем
-    existing_scene = await get_scene(bot_id, scene_name)
-    if existing_scene:
-        await message.answer(
-            "❌ <b>Сцена с таким именем уже существует!</b>\n\n"
-            "Пожалуйста, выберите другое имя:"
-        )
-        return
-    
-    await state.update_data(scene_name=scene_name)
-    await state.set_state(BotConstructorStates.waiting_scene_message)
-    
-    await message.answer(
-        f"✅ Имя сцены: <b>{scene_name}</b>\n\n"
-        "Введите текст первого сообщения для этой сцены:\n\n"
-        "<b>Доступные переменные:</b>\n"
-        "<code>##stars##</code> - количество звезд\n"
-        "<code>##name_user##</code> - имя пользователя\n"
-        "<code>##ID_user##</code> - ID пользователя\n"
-        "<code>##user_user##</code> - username\n\n"
-        "<i>Пример: Привет, ##name_user##! У тебя ##stars## звезд.</i>",
-        reply_markup=get_cancel_keyboard()
-    )
+@main_router.callback_query(F.data.startswith("buy_template_"))
+async def buy_template_callback(call: CallbackQuery, state: FSMContext):
+    template_id = int(call.data.split('_')[2])
+    user_id = call.from_user.id
+    async with aiosqlite.connect('kneo.db') as db:
+        db.row_factory = aiosqlite.Row
+        tmpl = await (await db.execute('SELECT * FROM templates WHERE id = ?', (template_id,))).fetchone()
+        if not tmpl:
+            await call.answer("Шаблон не найден", show_alert=True)
+            return
+        user = await get_user(user_id)
+        if user['kn_balance'] < tmpl['price']:
+            await call.answer("❌ Недостаточно Кнеток! Пополни баланс.", show_alert=True)
+            return
+        # Проверяем, не покупал ли уже
+        already = await db.execute('SELECT 1 FROM template_purchases WHERE user_id = ? AND template_id = ?',
+                                   (user_id, template_id))
+        if await already.fetchone():
+            await call.answer("Ты уже покупал этот шаблон", show_alert=True)
+            return
+        # Списание
+        await db.execute('UPDATE users SET kn_balance = kn_balance - ? WHERE user_id = ?',
+                         (tmpl['price'], user_id))
+        # Роялти автору
+        royalty = tmpl['price'] * ROYALTY_PERCENT / 100
+        await db.execute('UPDATE users SET kn_balance = kn_balance + ? WHERE user_id = ?',
+                         (royalty, tmpl['author_id']))
+        # Запись покупки
+        await db.execute('INSERT INTO template_purchases (user_id, template_id) VALUES (?, ?)',
+                         (user_id, template_id))
+        # Создание бота из шаблона (копирование токена не нужно, шаблон — это код, а не токен)
+        # Здесь мы просто отмечаем, что у пользователя теперь есть право запустить шаблон
+        # В реальности нужно сохранить файл шаблона и при создании бота использовать его код
+        # Упрощённо: создаём запись в user_bots с флагом is_template=1 и template_author
+        # Токен пользователь введёт позже, но бот будет использовать логику шаблона
+        await db.commit()
+    await call.answer("✅ Покупка совершена! Теперь ты можешь создать бота на основе этого шаблона.", show_alert=True)
+    await my_bots_callback(call)
 
-@main_router.message(BotConstructorStates.waiting_scene_message)
-async def process_scene_message(message: Message, state: FSMContext):
-    """Обработка ввода текста сцены"""
-    scene_text = message.text
-    
-    data = await state.get_data()
-    bot_id = data['bot_id']
-    scene_name = data['scene_name']
-    
-    # Сохраняем первое сообщение
-    await state.update_data(scene_messages=[scene_text])
-    
-    await message.answer(
-        f"✅ <b>Первое сообщение добавлено!</b>\n\n"
-        f"Текст сообщения (с вотермаркой):\n"
-        f"{WATERMARK_IN_TEXT}{scene_text}\n\n"
-        "Хотите добавить еще одно сообщение в эту сцену?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Да, добавить", callback_data="add_more_messages"),
-                InlineKeyboardButton(text="❌ Нет, хватит", callback_data="no_more_messages")
-            ]
-        ])
-    )
-
-@main_router.callback_query(F.data == "add_more_messages")
-async def add_more_messages_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик добавления дополнительных сообщений"""
-    await callback.answer()
-    
-    await state.set_state(BotConstructorStates.waiting_more_messages)
-    
-    await callback.message.edit_text(
-        "➕ <b>Добавление сообщения</b>\n\n"
-        "Введите текст следующего сообщения для этой сцены:\n\n"
-        "<b>Доступные переменные:</b>\n"
-        "<code>##stars##</code> - количество звезд\n"
-        "<code>##name_user##</code> - имя пользователя\n"
-        "<code>##ID_user##</code> - ID пользователя\n"
-        "<code>##user_user##</code> - username",
-        reply_markup=get_cancel_keyboard()
-    )
-
-@main_router.message(BotConstructorStates.waiting_more_messages)
-async def process_more_messages(message: Message, state: FSMContext):
-    """Обработка ввода дополнительных сообщений"""
-    new_message = message.text
-    
-    data = await state.get_data()
-    scene_messages = data.get('scene_messages', [])
-    scene_messages.append(new_message)
-    
-    await state.update_data(scene_messages=scene_messages)
-    
-    await message.answer(
-        f"✅ <b>Сообщение {len(scene_messages)} добавлено!</b>\n\n"
-        f"Всего сообщений в сцене: {len(scene_messages)}\n\n"
-        "Хотите добавить еще одно сообщение?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Да, добавить", callback_data="add_more_messages"),
-                InlineKeyboardButton(text="❌ Нет, хватит", callback_data="no_more_messages")
-            ]
-        ])
-    )
-
-@main_router.callback_query(F.data == "no_more_messages")
-async def no_more_messages_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик завершения добавления сообщений"""
-    await callback.answer()
-    
-    data = await state.get_data()
-    bot_id = data['bot_id']
-    scene_name = data['scene_name']
-    scene_messages = data.get('scene_messages', [])
-    
-    # Сохраняем сцену с сообщениями
-    await save_scene(bot_id, scene_name, scene_messages)
-    
-    await callback.message.edit_text(
-        f"✅ <b>Сцена '{scene_name}' создана!</b>\n\n"
-        f"Количество сообщений: {len(scene_messages)}\n"
-        "Теперь вы можете добавить кнопки к последнему сообщению:",
-        reply_markup=get_scene_management_keyboard(scene_name)
-    )
-
-@main_router.callback_query(F.data.in_(["content_photo_disabled", "content_video_disabled"]))
-async def media_disabled_callback(callback: CallbackQuery):
-    """Обработчик выбора недоступного типа контента"""
-    await callback.answer("Данная функция временно недоступна", show_alert=True)
-
-@main_router.callback_query(F.data == "add_button_to_scene")
-async def add_button_to_scene_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик добавления кнопки к сцене"""
-    await callback.answer()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    
-    if not user_bot:
-        await callback.message.answer("Сначала настройте бота!")
-        return
-    
-    # Получаем сцены пользователя
-    scenes = await get_bot_scenes(user_bot['id'])
-    
-    if not scenes:
-        await callback.message.edit_text(
-            "📭 <b>У вас еще нет сцен</b>\n\n"
-            "Сначала создайте сцену!"
-        )
-        return
-    
-    # Создаем клавиатуру выбора сцены для добавления кнопки
-    scene_buttons = []
-    for scene in scenes:
-        messages = json.loads(scene['messages_json'])
-        message_count = len(messages)
-        scene_buttons.append([
-            InlineKeyboardButton(
-                text=f"📄 {scene['name']} ({message_count} сообщ.)",
-                callback_data=f"select_scene_{scene['name']}"
-            )
-        ])
-    
-    scene_buttons.append([
-        InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
+# ---------- Админ панель ----------
+def admin_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="💎 Начислить Кнетки", callback_data="admin_give_kn")],
+        [InlineKeyboardButton(text="📦 Модерация шаблонов", callback_data="admin_moderate")],
+        [InlineKeyboardButton(text="🎫 Создать промокод", callback_data="admin_create_promo")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
     ])
-    
-    await callback.message.edit_text(
-        "🔘 <b>Добавление кнопки</b>\n\n"
-        "Выберите сцену, к которой хотите добавить кнопку:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=scene_buttons)
-    )
 
-@main_router.callback_query(F.data.startswith("select_scene_"))
-async def select_scene_for_button_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик выбора сцены для добавления кнопки"""
-    await callback.answer()
-    
-    scene_name = callback.data.replace("select_scene_", "")
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    if not user_bot:
+@main_router.callback_query(F.data == "admin_panel")
+async def admin_panel_callback(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Доступ запрещён", show_alert=True)
         return
-    
-    await state.update_data(selected_scene=scene_name, bot_id=user_bot['id'])
-    
-    await callback.message.edit_text(
-        f"🔘 <b>Добавление кнопки к сцене '{scene_name}'</b>\n\n"
-        "Выберите тип кнопки:",
-        reply_markup=get_button_type_keyboard()
+    await call.message.edit_text("👑 <b>Админ панель</b>", reply_markup=admin_keyboard())
+
+# Рассылка
+@main_router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(ConstructorStates.waiting_broadcast)
+    await call.message.edit_text(
+        "Отправь сообщение для рассылки (текст, фото, видео).",
+        reply_markup=cancel_keyboard()
     )
 
-@main_router.callback_query(F.data == "button_type_url")
-async def button_type_url_callback(callback: CallbackQuery, state: FSMContext):
-    """Выбор типа кнопки - URL"""
-    await callback.answer()
-    
-    await state.update_data(button_type="url")
-    await state.set_state(BotConstructorStates.waiting_button_text)
-    
-    await callback.message.edit_text(
-        "🔗 <b>Создание кнопки-ссылки</b>\n\n"
-        "Введите текст для кнопки:",
-        reply_markup=get_cancel_keyboard()
-    )
-
-@main_router.callback_query(F.data == "button_type_scene")
-async def button_type_scene_callback(callback: CallbackQuery, state: FSMContext):
-    """Выбор типа кнопки - переход на сцену"""
-    await callback.answer()
-    
-    data = await state.get_data()
-    bot_id = data['bot_id']
-    
-    # Получаем все сцены для выбора целевой
-    scenes = await get_bot_scenes(bot_id)
-    
-    scene_buttons = []
-    for scene in scenes:
-        messages = json.loads(scene['messages_json'])
-        message_count = len(messages)
-        scene_buttons.append([
-            InlineKeyboardButton(
-                text=f"📄 {scene['name']} ({message_count} сообщ.)",
-                callback_data=f"target_scene_{scene['name']}"
+@main_router.message(ConstructorStates.waiting_broadcast)
+async def admin_broadcast_send(message: Message, state: FSMContext):
+    # Получаем всех пользователей
+    async with aiosqlite.connect('kneo.db') as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('SELECT user_id FROM users')
+        users = await cursor.fetchall()
+    success = 0
+    for u in users:
+        try:
+            await main_bot.copy_message(
+                chat_id=u['user_id'],
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
             )
-        ])
-    
-    scene_buttons.append([
-        InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
-    ])
-    
-    await state.update_data(button_type="scene")
-    
-    await callback.message.edit_text(
-        "🔄 <b>Создание кнопки перехода на сцену</b>\n\n"
-        "Введите текст для кнопки:",
-        reply_markup=get_cancel_keyboard()
-    )
-    await state.set_state(BotConstructorStates.waiting_button_text)
-
-@main_router.callback_query(F.data == "button_type_variable")
-async def button_type_variable_callback(callback: CallbackQuery, state: FSMContext):
-    """Выбор типа кнопки - изменение переменной"""
-    await callback.answer()
-    
-    await state.update_data(button_type="variable")
-    await state.set_state(BotConstructorStates.waiting_button_text)
-    
-    await callback.message.edit_text(
-        "⭐ <b>Создание кнопки изменения переменной</b>\n\n"
-        "Введите текст для кнопки (например: 'Получить звезду'):",
-        reply_markup=get_cancel_keyboard()
-    )
-
-@main_router.message(BotConstructorStates.waiting_button_text)
-async def process_button_text(message: Message, state: FSMContext):
-    """Обработка ввода текста кнопки"""
-    button_text = message.text
-    
-    data = await state.get_data()
-    button_type = data.get('button_type')
-    
-    await state.update_data(button_text=button_text)
-    
-    if button_type == "url":
-        await state.set_state(BotConstructorStates.waiting_button_url)
-        await message.answer(
-            f"📝 Текст кнопки: <b>{button_text}</b>\n\n"
-            "Теперь введите URL для кнопки:\n"
-            "<i>Пример: https://example.com</i>",
-            reply_markup=get_cancel_keyboard()
-        )
-    elif button_type == "scene":
-        # Получаем список сцен для выбора
-        bot_id = data['bot_id']
-        scenes = await get_bot_scenes(bot_id)
-        
-        scene_buttons = []
-        for scene in scenes:
-            messages = json.loads(scene['messages_json'])
-            message_count = len(messages)
-            scene_buttons.append([
-                InlineKeyboardButton(
-                    text=f"📄 {scene['name']} ({message_count} сообщ.)",
-                    callback_data=f"target_scene_{scene['name']}"
-                )
-            ])
-        
-        scene_buttons.append([
-            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
-        ])
-        
-        await message.answer(
-            f"📝 Текст кнопки: <b>{button_text}</b>\n\n"
-            "Выберите сцену, на которую будет вести кнопка:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=scene_buttons)
-        )
-    elif button_type == "variable":
-        await state.set_state(BotConstructorStates.waiting_variable_action)
-        
-        await message.answer(
-            f"📝 Текст кнопки: <b>{button_text}</b>\n\n"
-            "Выберите действие с переменной 'stars':",
-            reply_markup=get_variable_action_keyboard()
-        )
-
-@main_router.message(BotConstructorStates.waiting_button_url)
-async def process_button_url(message: Message, state: FSMContext):
-    """Обработка ввода URL кнопки"""
-    url = message.text
-    
-    if not (url.startswith("http://") or url.startswith("https://")):
-        await message.answer(
-            "❌ <b>Некорректный URL!</b>\n\n"
-            "URL должен начинаться с http:// или https://\n"
-            "Попробуйте еще раз:"
-        )
-        return
-    
-    data = await state.get_data()
-    await save_button_to_scene(data, url=url)
+            success += 1
+            await asyncio.sleep(0.05)
+        except:
+            pass
+    await message.answer(f"✅ Рассылка завершена. Отправлено {success} пользователям.")
     await state.clear()
-    
-    await message.answer(
-        "✅ <b>Кнопка-ссылка успешно добавлена!</b>\n\n"
-        f"Текст: {data['button_text']}\n"
-        f"URL: {url}\n\n"
-        "Вы можете добавить еще кнопки или завершить сцену.",
-        reply_markup=get_scene_management_keyboard(data.get('selected_scene'))
+
+# Начисление Кнеток
+@main_router.callback_query(F.data == "admin_give_kn")
+async def admin_give_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(ConstructorStates.waiting_give_kn)
+    await call.message.edit_text(
+        "Введи ID пользователя и сумму через пробел.\nПример: 123456789 50",
+        reply_markup=cancel_keyboard()
     )
 
-@main_router.callback_query(F.data.startswith("target_scene_"))
-async def target_scene_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик выбора целевой сцены"""
-    await callback.answer()
-    
-    target_scene = callback.data.replace("target_scene_", "")
-    
-    data = await state.get_data()
-    await save_button_to_scene(data, target_scene=target_scene)
-    await state.clear()
-    
-    await callback.message.edit_text(
-        "✅ <b>Кнопка перехода успешно добавлена!</b>\n\n"
-        f"Текст: {data['button_text']}\n"
-        f"Целевая сцена: {target_scene}\n\n"
-        "Вы можете добавить еще кнопки или завершить сцену.",
-        reply_markup=get_scene_management_keyboard(data.get('selected_scene'))
-    )
-
-@main_router.callback_query(F.data.startswith("var_action_"))
-async def variable_action_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик выбора действия с переменной"""
-    await callback.answer()
-    
-    action = callback.data.replace("var_action_", "")
-    
-    data = await state.get_data()
-    
-    if action in ["plus_1", "minus_1"]:
-        # Для простых действий сразу сохраняем кнопку
-        action_type = "+1" if action == "plus_1" else "-1"
-        await save_button_to_scene(data, variable_action=action_type)
-        await state.clear()
-        
-        action_text = "увеличить на 1" if action == "plus_1" else "уменьшить на 1"
-        await callback.message.edit_text(
-            "✅ <b>Кнопка изменения переменной добавлена!</b>\n\n"
-            f"Текст: {data['button_text']}\n"
-            f"Действие: {action_text}\n"
-            f"Переменная: stars\n\n"
-            "Вы можете добавить еще кнопки или завершить сцену.",
-            reply_markup=get_scene_management_keyboard(data.get('selected_scene'))
-        )
-    elif action == "set":
-        # Для установки значения запрашиваем число
-        await state.set_state(BotConstructorStates.waiting_variable_value)
-        
-        await callback.message.edit_text(
-            "✏️ <b>Установка значения переменной</b>\n\n"
-            "Введите новое значение для переменной 'stars' (целое число):",
-            reply_markup=get_cancel_keyboard()
-        )
-
-@main_router.message(BotConstructorStates.waiting_variable_value)
-async def process_variable_value(message: Message, state: FSMContext):
-    """Обработка ввода значения переменной"""
+@main_router.message(ConstructorStates.waiting_give_kn)
+async def admin_give_process(message: Message, state: FSMContext):
     try:
-        value = int(message.text)
-        
-        data = await state.get_data()
-        await save_button_to_scene(data, variable_action=f"set:{value}")
-        await state.clear()
-        
-        await message.answer(
-            "✅ <b>Кнопка изменения переменной добавлена!</b>\n\n"
-            f"Текст: {data['button_text']}\n"
-            f"Действие: установить значение {value}\n"
-            f"Переменная: stars\n\n"
-            "Вы можете добавить еще кнопки или завершить сцену.",
-            reply_markup=get_scene_management_keyboard(data.get('selected_scene'))
-        )
-    except ValueError:
-        await message.answer(
-            "❌ <b>Некорректное значение!</b>\n\n"
-            "Пожалуйста, введите целое число:",
-            reply_markup=get_cancel_keyboard()
-        )
-
-async def save_button_to_scene(data: Dict, url: str = None, target_scene: str = None, variable_action: str = None):
-    """Сохранение кнопки в сцену"""
-    bot_id = data['bot_id']
-    scene_name = data['selected_scene']
-    button_text = data['button_text']
-    button_type = data['button_type']
-    
-    # Получаем текущие кнопки сцены
-    scene = await get_scene(bot_id, scene_name)
-    buttons = json.loads(scene['buttons_json']) if scene['buttons_json'] else []
-    
-    # Создаем новую кнопку
-    button_data = {"text": button_text, "type": button_type}
-    if button_type == "url" and url:
-        button_data["url"] = url
-    elif button_type == "scene" and target_scene:
-        button_data["target_scene"] = target_scene
-    elif button_type == "variable" and variable_action:
-        button_data["variable_action"] = variable_action
-    
-    buttons.append(button_data)
-    
-    # Сохраняем обновленные кнопки
-    await update_scene_buttons(bot_id, scene_name, buttons)
-
-@main_router.callback_query(F.data == "add_message_to_scene")
-async def add_message_to_scene_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик добавления сообщения к существующей сцене"""
-    await callback.answer()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    if not user_bot:
-        return
-    
-    # Получаем сцены пользователя
-    scenes = await get_bot_scenes(user_bot['id'])
-    
-    if not scenes:
-        await callback.message.edit_text(
-            "📭 <b>У вас еще нет сцен</b>\n\n"
-            "Сначала создайте сцену!"
-        )
-        return
-    
-    # Создаем клавиатуру выбора сцены
-    scene_buttons = []
-    for scene in scenes:
-        messages = json.loads(scene['messages_json'])
-        message_count = len(messages)
-        scene_buttons.append([
-            InlineKeyboardButton(
-                text=f"📄 {scene['name']} ({message_count} сообщ.)",
-                callback_data=f"add_msg_scene_{scene['name']}"
-            )
-        ])
-    
-    scene_buttons.append([
-        InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
-    ])
-    
-    await callback.message.edit_text(
-        "➕ <b>Добавление сообщения к сцене</b>\n\n"
-        "Выберите сцену, к которой хотите добавить сообщение:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=scene_buttons)
-    )
-
-@main_router.callback_query(F.data.startswith("add_msg_scene_"))
-async def add_msg_to_scene_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик выбора сцены для добавления сообщения"""
-    await callback.answer()
-    
-    scene_name = callback.data.replace("add_msg_scene_", "")
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    if not user_bot:
-        return
-    
-    scene = await get_scene(user_bot['id'], scene_name)
-    
-    if not scene:
-        await callback.answer("Сцена не найдена!")
-        return
-    
-    await state.update_data(
-        bot_id=user_bot['id'],
-        scene_name=scene_name,
-        current_messages=json.loads(scene['messages_json'])
-    )
-    
-    await state.set_state(BotConstructorStates.waiting_new_message)
-    
-    await callback.message.edit_text(
-        f"➕ <b>Добавление сообщения к сцене '{scene_name}'</b>\n\n"
-        "Введите текст нового сообщения:\n\n"
-        "<b>Доступные переменные:</b>\n"
-        "<code>##stars##</code> - количество звезд\n"
-        "<code>##name_user##</code> - имя пользователя\n"
-        "<code>##ID_user##</code> - ID пользователя\n"
-        "<code>##user_user##</code> - username",
-        reply_markup=get_cancel_keyboard()
-    )
-
-@main_router.message(BotConstructorStates.waiting_new_message)
-async def process_new_message(message: Message, state: FSMContext):
-    """Обработка ввода нового сообщения для сцены"""
-    new_message = message.text
-    
-    data = await state.get_data()
-    bot_id = data['bot_id']
-    scene_name = data['scene_name']
-    current_messages = data['current_messages']
-    
-    # Добавляем новое сообщение
-    current_messages.append(new_message)
-    
-    # Обновляем сцену
-    await update_scene_messages(bot_id, scene_name, current_messages)
-    
+        uid, amount = message.text.split()
+        uid = int(uid)
+        amount = float(amount)
+        await add_kn(uid, amount, f"Начислено админом {message.from_user.id}")
+        await message.answer(f"✅ Пользователю {uid} начислено {amount} Кнеток.")
+    except:
+        await message.answer("❌ Ошибка формата. Попробуй снова.")
     await state.clear()
-    
-    await message.answer(
-        f"✅ <b>Сообщение добавлено к сцене '{scene_name}'!</b>\n\n"
-        f"Теперь в сцене {len(current_messages)} сообщений.",
-        reply_markup=get_scene_management_keyboard(scene_name)
-    )
 
-@main_router.callback_query(F.data == "my_scenes")
-async def my_scenes_callback(callback: CallbackQuery):
-    """Обработчик просмотра сцен"""
-    await callback.answer()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    
-    if not user_bot:
-        await callback.message.answer("Сначала настройте бота!")
+# Модерация шаблонов
+@main_router.callback_query(F.data == "admin_moderate")
+async def admin_moderate_list(call: CallbackQuery):
+    async with aiosqlite.connect('kneo.db') as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('SELECT * FROM templates WHERE is_approved = 0')
+        pending = await cursor.fetchall()
+    if not pending:
+        await call.message.edit_text("Нет шаблонов на модерацию.", reply_markup=admin_keyboard())
         return
-    
-    scenes = await get_bot_scenes(user_bot['id'])
-    
-    if not scenes:
-        await callback.message.edit_text(
-            "📭 <b>У вас еще нет сцен</b>\n\n"
-            "Создайте свою первую сцену!",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🆕 Создать сцену", callback_data="create_scene")],
-                [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")]
-            ])
-        )
-    else:
-        await callback.message.edit_text(
-            f"📋 <b>Ваши сцены ({len(scenes)})</b>\n\n"
-            "Выберите сцену для просмотра или редактирования:",
-            reply_markup=get_scenes_list_keyboard(scenes)
-        )
+    text = "Шаблоны на проверку:\n"
+    kb = InlineKeyboardBuilder()
+    for t in pending:
+        kb.row(InlineKeyboardButton(
+            text=f"{t['name']} от {t['author_id']}",
+            callback_data=f"mod_template_{t['id']}"
+        ))
+    kb.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel"))
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
 
-@main_router.callback_query(F.data.startswith("scene_"))
-async def scene_detail_callback(callback: CallbackQuery):
-    """Обработчик просмотра деталей сцены"""
-    await callback.answer()
-    
-    scene_name = callback.data.replace("scene_", "")
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    if not user_bot:
+@main_router.callback_query(F.data.startswith("mod_template_"))
+async def admin_moderate_detail(call: CallbackQuery, state: FSMContext):
+    tid = int(call.data.split('_')[2])
+    async with aiosqlite.connect('kneo.db') as db:
+        db.row_factory = aiosqlite.Row
+        tmpl = await (await db.execute('SELECT * FROM templates WHERE id = ?', (tid,))).fetchone()
+    if not tmpl:
+        await call.answer("Шаблон не найден")
         return
-    
-    scene = await get_scene(user_bot['id'], scene_name)
-    
-    if not scene:
-        await callback.answer("Сцена не найдена!")
-        return
-    
-    messages = json.loads(scene['messages_json'])
-    buttons = json.loads(scene['buttons_json']) if scene['buttons_json'] else []
-    
-    scene_info = f"📄 <b>Сцена: {scene['name']}</b>\n\n"
-    scene_info += f"<b>Количество сообщений:</b> {len(messages)}\n\n"
-    
-    scene_info += "<b>Сообщения:</b>\n"
-    for i, msg in enumerate(messages, 1):
-        scene_info += f"{i}. {msg[:50]}...\n"
-    
-    if buttons:
-        scene_info += "\n<b>Кнопки:</b>\n"
-        for i, btn in enumerate(buttons, 1):
-            if btn['type'] == 'url':
-                scene_info += f"{i}. {btn['text']} → {btn['url']}\n"
-            elif btn['type'] == 'scene':
-                scene_info += f"{i}. {btn['text']} → сцена: {btn['target_scene']}\n"
-            elif btn['type'] == 'variable':
-                action = btn.get('variable_action', '')
-                if action == "+1":
-                    scene_info += f"{i}. {btn['text']} → +1 звезда\n"
-                elif action == "-1":
-                    scene_info += f"{i}. {btn['text']} → -1 звезда\n"
-                elif action.startswith("set:"):
-                    value = action.replace("set:", "")
-                    scene_info += f"{i}. {btn['text']} → установить {value} звезд\n"
-    else:
-        scene_info += "\n<i>Кнопок пока нет</i>\n"
-    
-    await callback.message.edit_text(
-        scene_info,
-        reply_markup=get_scene_management_keyboard(scene_name)
-    )
-
-@main_router.callback_query(F.data == "finish_scene")
-async def finish_scene_callback(callback: CallbackQuery):
-    """Завершение редактирования сцены"""
-    await callback.answer()
-    
-    await callback.message.edit_text(
-        "✅ <b>Сцена сохранена!</b>\n\n"
-        "Возвращаемся к списку сцен.",
+    await call.message.edit_text(
+        f"Шаблон: {tmpl['name']}\n"
+        f"Автор: {tmpl['author_id']}\n"
+        f"Цена: {tmpl['price']} KN\n"
+        f"Описание: {tmpl['description']}\n\n"
+        "Подтвердить публикацию?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Мои сцены", callback_data="my_scenes")],
-            [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")]
+            [InlineKeyboardButton(text="✅ Да", callback_data=f"approve_template_{tid}")],
+            [InlineKeyboardButton(text="❌ Нет", callback_data=f"reject_template_{tid}")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_moderate")]
         ])
     )
 
-@main_router.callback_query(F.data == "delete_scene")
-async def delete_scene_callback(callback: CallbackQuery):
-    """Удаление сцены"""
-    await callback.answer()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    if not user_bot:
-        return
-    
-    # Получаем текущую сцену из сообщения (первая строка после "Сцена: ")
-    message_text = callback.message.text
-    scene_line = message_text.split('\n')[0]
-    scene_name = scene_line.split(': ')[1].replace('</b>', '')
-    
-    await delete_scene(user_bot['id'], scene_name)
-    
-    await callback.message.edit_text(
-        f"✅ <b>Сцена '{scene_name}' удалена!</b>\n\n"
-        "Возвращаемся к списку сцен.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Мои сцены", callback_data="my_scenes")],
-            [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")]
-        ])
+@main_router.callback_query(F.data.startswith("approve_template_"))
+async def admin_approve_template(call: CallbackQuery):
+    tid = int(call.data.split('_')[2])
+    async with aiosqlite.connect('kneo.db') as db:
+        await db.execute('UPDATE templates SET is_approved = 1 WHERE id = ?', (tid,))
+        await db.commit()
+    await call.answer("Шаблон опубликован в магазине.", show_alert=True)
+    await admin_moderate_list(call)
+
+@main_router.callback_query(F.data.startswith("reject_template_"))
+async def admin_reject_template(call: CallbackQuery):
+    tid = int(call.data.split('_')[2])
+    async with aiosqlite.connect('kneo.db') as db:
+        await db.execute('DELETE FROM templates WHERE id = ?', (tid,))
+        await db.commit()
+    await call.answer("Шаблон удалён.", show_alert=True)
+    await admin_moderate_list(call)
+
+# Промокоды
+@main_router.callback_query(F.data == "admin_create_promo")
+async def admin_create_promo(call: CallbackQuery, state: FSMContext):
+    await state.set_state(ConstructorStates.waiting_promo_code)
+    await call.message.edit_text(
+        "Введи данные промокода в формате:\n"
+        "<code>КОД СУММА КОЛИЧЕСТВО_ИСПОЛЬЗОВАНИЙ</code>\n"
+        "Пример: BONUS10 10 5",
+        reply_markup=cancel_keyboard()
     )
 
-@main_router.callback_query(F.data == "start_bot")
-async def start_bot_callback(callback: CallbackQuery):
-    """Запуск пользовательского бота"""
-    await callback.answer()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    
-    if not user_bot:
-        await callback.message.answer("Сначала настройте бота!")
-        return
-    
-    token = user_bot['bot_token']
-    
-    if token in user_bots:
-        await callback.message.edit_text("Бот уже запущен!")
-        return
-    
-    # Запускаем бота
-    success = await start_user_bot(token)
-    
-    if success:
-        await set_bot_active_status(user_bot['id'], True)
-        
-        await callback.message.edit_text(
-            "✅ <b>Бот успешно запущен!</b>\n\n"
-            f"Теперь ваш бот @{user_bot['bot_username']} отвечает на сообщения.\n"
-            f"Используйте команду /start в вашем боте для проверки.",
-            reply_markup=get_main_keyboard()
-        )
-    else:
-        await callback.message.edit_text(
-            "❌ <b>Не удалось запустить бота!</b>\n\n"
-            "Проверьте токен бота и попробуйте снова.",
-            reply_markup=get_main_keyboard()
-        )
+@main_router.message(ConstructorStates.waiting_promo_code)
+async def admin_create_promo_process(message: Message, state: FSMContext):
+    try:
+        code, amount, uses = message.text.split()
+        amount = float(amount)
+        uses = int(uses)
+        async with aiosqlite.connect('kneo.db') as db:
+            await db.execute('''
+                INSERT INTO promos (code, amount, uses_left, created_by)
+                VALUES (?, ?, ?, ?)
+            ''', (code, amount, uses, message.from_user.id))
+            await db.commit()
+        await message.answer(f"✅ Промокод {code} создан!")
+    except:
+        await message.answer("❌ Ошибка формата.")
+    await state.clear()
 
-@main_router.callback_query(F.data == "stop_bot")
-async def stop_bot_callback(callback: CallbackQuery):
-    """Остановка пользовательского бота"""
-    await callback.answer()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    
-    if not user_bot:
-        await callback.message.answer("Сначала настройте бота!")
-        return
-    
-    token = user_bot['bot_token']
-    
-    if token not in user_bots:
-        await callback.message.edit_text("Бот не запущен!")
-        return
-    
-    # Останавливаем бота
-    await stop_user_bot(token)
-    await set_bot_active_status(user_bot['id'], False)
-    
-    await callback.message.edit_text(
-        "⏹ <b>Бот остановлен!</b>\n\n"
-        f"Ваш бот @{user_bot['bot_username']} больше не отвечает на сообщения.\n"
-        f"Для возобновления работы нажмите 'Запустить бота'.",
-        reply_markup=get_main_keyboard()
-    )
-
-@main_router.callback_query(F.data == "bot_status")
-async def bot_status_callback(callback: CallbackQuery):
-    """Обработчик статуса бота"""
-    await callback.answer()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    
-    if not user_bot:
-        await callback.message.answer("Сначала настройте бота!")
-        return
-    
-    token = user_bot['bot_token']
-    is_running = token in user_bots
-    
-    scenes = await get_bot_scenes(user_bot['id'])
-    total_messages = sum(len(json.loads(s['messages_json'])) for s in scenes)
-    
-    status_text = f"📊 <b>Статус бота @{user_bot['bot_username']}</b>\n\n"
-    status_text += f"• Статус: {'🟢 Запущен' if is_running else '🔴 Остановлен'}\n"
-    status_text += f"• Сцен: {len(scenes)}\n"
-    status_text += f"• Сообщений: {total_messages}\n"
-    status_text += f"• Создан: {datetime.fromisoformat(user_bot['created_at']).strftime('%d.%m.%Y')}\n\n"
-    
-    if scenes:
-        status_text += "<b>Последние сцены:</b>\n"
-        for scene in scenes[:3]:
-            messages = json.loads(scene['messages_json'])
-            buttons = json.loads(scene['buttons_json']) if scene['buttons_json'] else []
-            status_text += f"• {scene['name']} ({len(messages)} сообщ., {len(buttons)} кнопок)\n"
-        
-        if len(scenes) > 3:
-            status_text += f"... и еще {len(scenes) - 3} сцен\n"
-    
-    await callback.message.edit_text(
-        status_text,
-        reply_markup=get_main_keyboard()
-    )
-
-@main_router.callback_query(F.data == "change_token")
-async def change_token_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик смены токена"""
-    await callback.answer()
-    
-    await callback.message.edit_text(
-        "🔄 <b>Смена токена бота</b>\n\n"
-        "Отправьте новый токен бота:\n"
-        "<i>Пример: 1234567890:ABCDefGhIJKlmNoPQRsTUVwxyZ</i>",
-        reply_markup=get_cancel_keyboard()
-    )
-    
-    await state.set_state(BotConstructorStates.waiting_for_token)
-
-@main_router.callback_query(F.data.startswith("page_"))
-async def page_callback(callback: CallbackQuery):
-    """Обработчик переключения страниц"""
-    await callback.answer()
-    
-    page = int(callback.data.replace("page_", ""))
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    if not user_bot:
-        return
-    
-    scenes = await get_bot_scenes(user_bot['id'])
-    
-    await callback.message.edit_text(
-        f"📋 <b>Ваши сцены ({len(scenes)})</b>\n\n"
-        "Выберите сцену для просмотра или редактирования:",
-        reply_markup=get_scenes_list_keyboard(scenes, page)
-    )
-
-@main_router.callback_query(F.data == "back_to_scenes")
-async def back_to_scenes_callback(callback: CallbackQuery):
-    """Возврат к списку сцен"""
-    await callback.answer()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    
-    if not user_bot:
-        return
-    
-    scenes = await get_bot_scenes(user_bot['id'])
-    
-    await callback.message.edit_text(
-        f"📋 <b>Ваши сцены ({len(scenes)})</b>\n\n"
-        "Выберите сцену для просмотра или редактирования:",
-        reply_markup=get_scenes_list_keyboard(scenes)
-    )
-
-@main_router.callback_query(F.data == "back_to_main")
-async def back_to_main_callback(callback: CallbackQuery):
-    """Возврат в главное меню"""
-    await callback.answer()
-    
-    await callback.message.edit_text(
-        "👋 <b>Главное меню управления ботом</b>\n\n"
-        "Выберите действие:",
-        reply_markup=get_main_keyboard()
+# ---------- Общие кнопки ----------
+@main_router.callback_query(F.data == "back_main")
+async def back_main_callback(call: CallbackQuery):
+    await call.message.edit_text(
+        "👋 Главное меню",
+        reply_markup=main_keyboard()
     )
 
 @main_router.callback_query(F.data == "cancel")
-async def cancel_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработчик отмены действия"""
-    await callback.answer()
-    
+async def cancel_callback(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    
-    user_bot = await get_user_bot(callback.from_user.id)
-    
-    if user_bot:
-        await callback.message.edit_text(
-            "❌ Действие отменено.\n\n"
-            "Возврат в главное меню:",
-            reply_markup=get_main_keyboard()
-        )
+    await back_main_callback(call)
+
+# ========== ЗАПУСК ПОЛЬЗОВАТЕЛЬСКИХ БОТОВ ==========
+async def run_user_bot(token: str):
+    """Запускает бота пользователя. Если бот помечен как шаблонный, использует логику шаблона."""
+    bot_data = await get_bot_by_token(token)
+    if not bot_data:
+        return
+    if bot_data['is_template'] and TEMPLATE_AVAILABLE:
+        # Используем обработчики из шаблона
+        bot_instance = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        dp = Dispatcher(storage=MemoryStorage())
+        # Регистрируем хендлеры шаблона, передавая bot_data (автор, etc.)
+        await register_template_handlers(dp, bot_data)
+        task = asyncio.create_task(dp.start_polling(bot_instance))
+        user_bots[token] = (bot_instance, dp, task)
     else:
-        await callback.message.edit_text(
-            "❌ Действие отменено.\n\n"
-            "Отправьте токен бота для начала работы:"
-        )
-
-# ========== ПОЛЬЗОВАТЕЛЬСКИЕ БОТЫ ==========
-async def create_user_bot_handlers(token: str, bot_data: Dict):
-    """Создание обработчиков для пользовательского бота"""
-    router = Router()
-    
-    @router.message(CommandStart())
-    async def user_bot_start(message: Message):
-        """Обработчик команды /start для пользовательского бота"""
-        # Отправляем вотермарку отдельным сообщением ПЕРВЫМ делом
-        await message.answer(WATERMARK_MESSAGE)
-        
-        start_scene_name = bot_data.get('start_scene', 'start')
-        scene = await get_scene(bot_data['id'], start_scene_name)
-        
-        if not scene:
-            await message.answer("Добро пожаловать! Сцена 'start' не настроена.")
-            return
-        
-        # Получаем значение переменной stars для пользователя
-        stars_value = await get_user_variable(bot_data['id'], message.from_user.id, "stars")
-        
-        # Отправляем все сообщения сцены
-        messages = json.loads(scene['messages_json'])
-        buttons = json.loads(scene['buttons_json']) if scene['buttons_json'] else []
-        
-        # Отправляем все сообщения, кроме последнего
-        for msg in messages[:-1]:
-            parsed_text = parse_placeholders(
-                msg, 
-                {
-                    'id': message.from_user.id,
-                    'first_name': message.from_user.first_name,
-                    'username': message.from_user.username
-                },
-                stars_value
-            )
-            await message.answer(parsed_text)
-        
-        # Последнее сообщение с кнопками (если есть)
-        if messages:
-            last_msg = messages[-1]
-            parsed_text = parse_placeholders(
-                last_msg, 
-                {
-                    'id': message.from_user.id,
-                    'first_name': message.from_user.first_name,
-                    'username': message.from_user.username
-                },
-                stars_value
-            )
-            
-            if buttons:
-                keyboard_buttons = []
-                for btn in buttons:
-                    if btn['type'] == 'url':
-                        keyboard_buttons.append([
-                            InlineKeyboardButton(text=btn['text'], url=btn['url'])
-                        ])
-                    elif btn['type'] == 'scene':
-                        keyboard_buttons.append([
-                            InlineKeyboardButton(
-                                text=btn['text'], 
-                                callback_data=f"scene_{btn['target_scene']}"
-                            )
-                        ])
-                    elif btn['type'] == 'variable':
-                        keyboard_buttons.append([
-                            InlineKeyboardButton(
-                                text=btn['text'], 
-                                callback_data=f"variable_{btn['variable_action']}"
-                            )
-                        ])
-                
-                keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-                await message.answer(parsed_text, reply_markup=keyboard)
-            else:
-                await message.answer(parsed_text)
-    
-    @router.callback_query(F.data.startswith("scene_"))
-    async def user_bot_scene_callback(callback: CallbackQuery):
-        """Обработчик перехода между сценами"""
-        await callback.answer()
-        
-        scene_name = callback.data.replace("scene_", "")
-        scene = await get_scene(bot_data['id'], scene_name)
-        
-        if not scene:
-            await callback.message.answer("Сцена не найдена!")
-            return
-        
-        # Получаем значение переменной stars для пользователя
-        stars_value = await get_user_variable(bot_data['id'], callback.from_user.id, "stars")
-        
-        # Отправляем все сообщения сцены
-        messages = json.loads(scene['messages_json'])
-        buttons = json.loads(scene['buttons_json']) if scene['buttons_json'] else []
-        
-        # Отправляем все сообщения, кроме последнего
-        for msg in messages[:-1]:
-            parsed_text = parse_placeholders(
-                msg, 
-                {
-                    'id': callback.from_user.id,
-                    'first_name': callback.from_user.first_name,
-                    'username': callback.from_user.username
-                },
-                stars_value
-            )
-            await callback.message.answer(parsed_text)
-        
-        # Последнее сообщение с кнопками (если есть)
-        if messages:
-            last_msg = messages[-1]
-            parsed_text = parse_placeholders(
-                last_msg, 
-                {
-                    'id': callback.from_user.id,
-                    'first_name': callback.from_user.first_name,
-                    'username': callback.from_user.username
-                },
-                stars_value
-            )
-            
-            if buttons:
-                keyboard_buttons = []
-                for btn in buttons:
-                    if btn['type'] == 'url':
-                        keyboard_buttons.append([
-                            InlineKeyboardButton(text=btn['text'], url=btn['url'])
-                        ])
-                    elif btn['type'] == 'scene':
-                        keyboard_buttons.append([
-                            InlineKeyboardButton(
-                                text=btn['text'], 
-                                callback_data=f"scene_{btn['target_scene']}"
-                            )
-                        ])
-                    elif btn['type'] == 'variable':
-                        keyboard_buttons.append([
-                            InlineKeyboardButton(
-                                text=btn['text'], 
-                                callback_data=f"variable_{btn['variable_action']}"
-                            )
-                        ])
-                
-                keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-                await callback.message.answer(parsed_text, reply_markup=keyboard)
-            else:
-                await callback.message.answer(parsed_text)
-    
-    @router.callback_query(F.data.startswith("variable_"))
-    async def user_bot_variable_callback(callback: CallbackQuery):
-        """Обработчик изменения переменной"""
-        await callback.answer()
-        
-        action = callback.data.replace("variable_", "")
-        current_value = await get_user_variable(bot_data['id'], callback.from_user.id, "stars")
-        
-        if action == "+1":
-            new_value = current_value + 1
-            await update_user_variable(bot_data['id'], callback.from_user.id, "stars", new_value)
-            await callback.message.answer(f"✅ Звезда добавлена! Теперь у тебя {new_value} звезд.")
-        
-        elif action == "-1":
-            new_value = max(0, current_value - 1)  # Не меньше 0
-            await update_user_variable(bot_data['id'], callback.from_user.id, "stars", new_value)
-            await callback.message.answer(f"✅ Звезда убрана! Теперь у тебя {new_value} звезд.")
-        
-        elif action.startswith("set:"):
-            try:
-                new_value = int(action.replace("set:", ""))
-                await update_user_variable(bot_data['id'], callback.from_user.id, "stars", new_value)
-                await callback.message.answer(f"✅ Количество звезд установлено: {new_value}")
-            except ValueError:
-                await callback.message.answer("❌ Ошибка при установке значения")
-        
-        # После изменения переменной возвращаемся к текущей сцене
-        # (можно было бы переотправить текущую сцену, но для простоты просто отправляем сообщение)
-    
-    @router.message()
-    async def user_bot_echo(message: Message):
-        """Эхо-обработчик для пользовательского бота"""
-        await message.answer("Используйте /start для начала работы")
-    
-    return router
-
-async def start_user_bot(token: str) -> bool:
-    """Запуск пользовательского бота"""
-    try:
-        # Проверяем, не запущен ли уже бот
-        if token in user_bots:
-            return True
-        
-        # Получаем данные бота из БД
-        bot_data = await get_bot_by_token(token)
-        if not bot_data:
-            logger.error(f"Данные бота не найдены для токена: {token[:10]}...")
-            return False
-        
-        # Проверяем валидность токена
-        is_valid, bot_username = await check_bot_token(token)
-        if not is_valid:
-            logger.error(f"Невалидный токен: {token[:10]}...")
-            return False
-        
-        # Создаем экземпляр бота
-        user_bot = Bot(
-            token=token,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-        )
-        
-        # Создаем диспетчер
-        user_dp = Dispatcher(storage=MemoryStorage())
-        
-        # Создаем и добавляем обработчики
-        user_router = await create_user_bot_handlers(token, bot_data)
-        user_dp.include_router(user_router)
-        
-        # Запускаем поллинг в отдельной задаче
-        task = asyncio.create_task(run_user_bot_polling(user_bot, user_dp, token))
-        
-        # Сохраняем в глобальный словарь
-        user_bots[token] = (user_bot, user_dp, task)
-        
-        logger.info(f"Запущен пользовательский бот: @{bot_username}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Ошибка запуска пользовательского бота: {e}")
-        return False
-
-async def run_user_bot_polling(bot: Bot, dp: Dispatcher, token: str):
-    """Запуск поллинга для пользовательского бота"""
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Ошибка поллинга для бота {token[:10]}...: {e}")
-    finally:
-        # Удаляем бота из активных при остановке
-        if token in user_bots:
-            del user_bots[token]
-
-async def stop_user_bot(token: str):
-    """Остановка пользовательского бота"""
-    if token in user_bots:
-        user_bot, user_dp, task = user_bots[token]
-        
-        # Останавливаем поллинг
-        await user_dp.stop_polling()
-        
-        # Отменяем задачу
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        
-        # Удаляем из словаря
-        del user_bots[token]
-        
-        logger.info(f"Остановлен пользовательский бот с токеном {token[:10]}...")
-        return True
-    return False
+        # Кастомный бот с простыми сценами (заглушка)
+        # Здесь должен быть код для запуска бота с обычными сценами (из таблицы scenes)
+        # Пока просто пропускаем
+        pass
 
 async def start_all_user_bots():
-    """Запуск всех пользовательских ботов из БД"""
-    bots = await get_all_active_bots()
-    
-    tasks = []
-    for bot_data in bots:
-        token = bot_data.get('bot_token')
-        if token:
-            tasks.append(start_user_bot(token))
-    
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        successful = sum(1 for r in results if r is True)
-        logger.info(f"Запущено {successful}/{len(tasks)} пользовательских ботов")
-    else:
-        logger.info("Нет пользовательских ботов для запуска")
+    async with aiosqlite.connect('kneo.db') as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('SELECT * FROM user_bots WHERE is_active = 1')
+        bots = await cursor.fetchall()
+    for b in bots:
+        if b['bot_token'] not in user_bots:
+            await run_user_bot(b['bot_token'])
 
-# ========== ВЕБ-СЕРВЕР ДЛЯ RENDER ==========
+async def stop_user_bot(token: str):
+    if token in user_bots:
+        bot, dp, task = user_bots[token]
+        await dp.stop_polling()
+        task.cancel()
+        del user_bots[token]
+
+# ========== ВЕБ-СЕРВЕР ==========
 async def health_check(request):
-    """Проверка здоровья сервиса"""
-    return web.Response(text=f"Bot constructor is running! Active bots: {len(user_bots)}")
+    return web.Response(text=f"Kneo Bots active. Running bots: {len(user_bots)}")
 
 async def web_server():
-    """Запуск веб-сервера для поддержания активности на Render"""
     app = web.Application()
-    
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
-    
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
-    
-    logger.info(f"Web server started on port {PORT}")
+    logging.info(f"Web server started on port {PORT}")
     await site.start()
 
-# ========== ОСНОВНАЯ ФУНКЦИЯ ==========
+# ========== MAIN ==========
 async def main():
-    """Основная функция запуска бота"""
-    logger.info("Запуск конструктора ботов с системой переменных...")
-    
-    # Инициализация базы данных
+    logging.basicConfig(level=logging.INFO)
     await init_db()
-    
-    # Запуск веб-сервера в фоне
-    web_server_task = asyncio.create_task(web_server())
-    
-    # Запуск всех активных ботов из БД
+    asyncio.create_task(web_server())
     await start_all_user_bots()
-    
-    try:
-        # Запуск основного бота (конструктора)
-        await main_bot.delete_webhook(drop_pending_updates=True)
-        await main_dp.start_polling(main_bot)
-    except Exception as e:
-        logger.error(f"Ошибка при запуске основного бота: {e}")
-    finally:
-        # Остановка всех пользовательских ботов
-        for token in list(user_bots.keys()):
-            await stop_user_bot(token)
-        
-        # Отмена задачи веб-сервера
-        web_server_task.cancel()
-        try:
-            await web_server_task
-        except asyncio.CancelledError:
-            pass
+    await main_bot.delete_webhook(drop_pending_updates=True)
+    await main_dp.start_polling(main_bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
