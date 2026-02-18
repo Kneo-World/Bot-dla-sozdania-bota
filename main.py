@@ -45,6 +45,7 @@ class ConstructorStates(StatesGroup):
     delete_elements = State()
     create_variable = State()
     add_alias = State()
+    select_template = State()
 
 # ========== КЛАСС УПРАВЛЕНИЯ ПЕРЕМЕННЫМИ ==========
 class VariableManager:
@@ -228,8 +229,124 @@ async def init_db():
         FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE
     )''')
 
+    # Таблица шаблонов (глобальные, не привязаны к боту)
+    await db.execute('''CREATE TABLE IF NOT EXISTS templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT,
+        scenes_json TEXT NOT NULL   -- JSON-структура сцен
+    )''')
+
     await db.commit()
+
+    # Заполняем шаблоны, если их нет
+    await populate_templates(db)
     return db
+
+async def populate_templates(db):
+    # Проверяем, есть ли уже шаблоны
+    async with db.execute("SELECT COUNT(*) FROM templates") as cursor:
+        count = (await cursor.fetchone())[0]
+    if count > 0:
+        return
+
+    templates = [
+        {
+            "name": "Приветствие",
+            "description": "Простая сцена с приветствием и информацией о пользователе.",
+            "scenes": [
+                {
+                    "scene_id": "start",
+                    "name": "Старт",
+                    "messages": [
+                        "Привет, ##name_user##!",
+                        "Твой ID: ##ID_user##",
+                        "Твой username: ##user_user##"
+                    ],
+                    "buttons": []
+                }
+            ]
+        },
+        {
+            "name": "Меню с кнопками",
+            "description": "Сцена с главным меню и несколькими кнопками перехода.",
+            "scenes": [
+                {
+                    "scene_id": "start",
+                    "name": "Главное меню",
+                    "messages": [
+                        "Добро пожаловать в главное меню!"
+                    ],
+                    "buttons": [
+                        {"text": "Профиль", "action": "goto:profile"},
+                        {"text": "Магазин", "action": "goto:shop"},
+                        {"text": "Помощь", "action": "goto:help"}
+                    ]
+                },
+                {
+                    "scene_id": "profile",
+                    "name": "Профиль",
+                    "messages": [
+                        "Ваш профиль:",
+                        "Имя: ##name_user##",
+                        "ID: ##ID_user##"
+                    ],
+                    "buttons": [
+                        {"text": "Назад", "action": "goto:start"}
+                    ]
+                },
+                {
+                    "scene_id": "shop",
+                    "name": "Магазин",
+                    "messages": [
+                        "Добро пожаловать в магазин!",
+                        "Здесь скоро появятся товары."
+                    ],
+                    "buttons": [
+                        {"text": "Назад", "action": "goto:start"}
+                    ]
+                },
+                {
+                    "scene_id": "help",
+                    "name": "Помощь",
+                    "messages": [
+                        "Раздел помощи. Обратитесь к администратору."
+                    ],
+                    "buttons": [
+                        {"text": "Назад", "action": "goto:start"}
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "Рейтинг (система рангов)",
+            "description": "Демонстрация переменных и алиасов: ранг повышается/понижается.",
+            "scenes": [
+                {
+                    "scene_id": "start",
+                    "name": "Рейтинг",
+                    "messages": [
+                        "Привет, ##name_user##!",
+                        "Твой текущий ранг: ##rank##",
+                        "Звезд: ##stars##"
+                    ],
+                    "buttons": [
+                        {"text": "➕ Повысить ранг", "action": "rank ++ 1"},
+                        {"text": "➖ Понизить ранг", "action": "rank -- 1"},
+                        {"text": "⭐ Получить звезду", "action": "stars ++ 1"},
+                        {"text": "⭐ Потратить звезду", "action": "stars -- 1"}
+                    ]
+                }
+            ]
+        }
+    ]
+
+    for tpl in templates:
+        await db.execute(
+            "INSERT INTO templates (name, description, scenes_json) VALUES (?, ?, ?)",
+            (tpl["name"], tpl["description"], json.dumps(tpl["scenes"], ensure_ascii=False))
+        )
+    await db.commit()
 
 db = None
 
@@ -299,7 +416,14 @@ async def get_bot_scenes(bot_id: int) -> List[Dict]:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
-async def get_scene(bot_id: int, scene_id: str) -> Optional[Dict]:
+async def get_scene_by_db_id(scene_db_id: int) -> Optional[Dict]:
+    db_conn = await get_db()
+    db_conn.row_factory = aiosqlite.Row
+    async with db_conn.execute("SELECT * FROM scenes WHERE id = ?", (scene_db_id,)) as cursor:
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+async def get_scene_by_scene_id(bot_id: int, scene_id: str) -> Optional[Dict]:
     db_conn = await get_db()
     db_conn.row_factory = aiosqlite.Row
     async with db_conn.execute(
@@ -318,21 +442,20 @@ async def create_scene(bot_id: int, scene_id: str, name: str = None):
     )
     await db_conn.commit()
 
-async def add_message(scene_id: int, text: str) -> int:
+async def add_message(scene_db_id: int, text: str) -> int:
     db_conn = await get_db()
-    # Получаем следующий order
     async with db_conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE scene_id = ?", (scene_id,)
+        "SELECT COUNT(*) FROM messages WHERE scene_id = ?", (scene_db_id,)
     ) as cursor:
         count = (await cursor.fetchone())[0]
     cursor = await db_conn.execute(
         "INSERT INTO messages (scene_id, message_order, text, media_type) VALUES (?, ?, ?, ?)",
-        (scene_id, count + 1, text, "text")
+        (scene_db_id, count + 1, text, "text")
     )
     await db_conn.commit()
     return cursor.lastrowid
 
-async def add_button(scene_id: int, message_id: int, text: str, action: str):
+async def add_button(scene_db_id: int, message_id: int, text: str, action: str):
     db_conn = await get_db()
     async with db_conn.execute(
         "SELECT COUNT(*) FROM buttons WHERE message_id = ?", (message_id,)
@@ -340,7 +463,7 @@ async def add_button(scene_id: int, message_id: int, text: str, action: str):
         count = (await cursor.fetchone())[0]
     await db_conn.execute(
         "INSERT INTO buttons (scene_id, message_id, button_order, text, action) VALUES (?, ?, ?, ?, ?)",
-        (scene_id, message_id, count + 1, text, action)
+        (scene_db_id, message_id, count + 1, text, action)
     )
     await db_conn.commit()
 
@@ -352,6 +475,72 @@ async def delete_message(message_id: int):
 async def delete_button(button_id: int):
     db_conn = await get_db()
     await db_conn.execute("DELETE FROM buttons WHERE id = ?", (button_id,))
+    await db_conn.commit()
+
+async def get_messages(scene_db_id: int) -> List[Dict]:
+    db_conn = await get_db()
+    db_conn.row_factory = aiosqlite.Row
+    async with db_conn.execute(
+        "SELECT * FROM messages WHERE scene_id = ? ORDER BY message_order", (scene_db_id,)
+    ) as cursor:
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def get_buttons(message_id: int) -> List[Dict]:
+    db_conn = await get_db()
+    db_conn.row_factory = aiosqlite.Row
+    async with db_conn.execute(
+        "SELECT * FROM buttons WHERE message_id = ? ORDER BY button_order", (message_id,)
+    ) as cursor:
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def get_templates() -> List[Dict]:
+    db_conn = await get_db()
+    db_conn.row_factory = aiosqlite.Row
+    async with db_conn.execute("SELECT * FROM templates") as cursor:
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def apply_template(bot_id: int, template_id: int):
+    db_conn = await get_db()
+    async with db_conn.execute("SELECT scenes_json FROM templates WHERE id = ?", (template_id,)) as cursor:
+        row = await cursor.fetchone()
+        if not row:
+            return
+    scenes = json.loads(row[0])
+    for scene_data in scenes:
+        scene_id = scene_data["scene_id"]
+        name = scene_data.get("name", scene_id)
+        # Создаём сцену
+        await db_conn.execute(
+            "INSERT INTO scenes (bot_id, scene_id, name) VALUES (?, ?, ?)",
+            (bot_id, scene_id, name)
+        )
+        # Получаем id сцены
+        async with db_conn.execute(
+            "SELECT id FROM scenes WHERE bot_id = ? AND scene_id = ?", (bot_id, scene_id)
+        ) as cur:
+            scene_db_id = (await cur.fetchone())[0]
+
+        # Добавляем сообщения
+        for msg_text in scene_data.get("messages", []):
+            await add_message(scene_db_id, msg_text)
+
+        # Добавляем кнопки (предполагаем, что кнопки привязаны к последнему сообщению)
+        # Для простоты добавляем все кнопки к первому сообщению? Лучше - к последнему.
+        # В шаблоне может быть несколько сообщений. Для каждого сообщения могут быть свои кнопки.
+        # В нашей структуре шаблона кнопки не привязаны к конкретному сообщению, поэтому добавим их к первому.
+        # Это упрощение, но для демо сойдёт.
+        if scene_data.get("buttons"):
+            # Получаем первое сообщение сцены
+            async with db_conn.execute(
+                "SELECT id FROM messages WHERE scene_id = ? ORDER BY message_order LIMIT 1", (scene_db_id,)
+            ) as cur:
+                first_msg = await cur.fetchone()
+                if first_msg:
+                    for btn in scene_data["buttons"]:
+                        await add_button(scene_db_id, first_msg[0], btn["text"], btn["action"])
     await db_conn.commit()
 
 # ========== ЗАПУСК/ОСТАНОВКА ПОЛЬЗОВАТЕЛЬСКИХ БОТОВ ==========
@@ -383,62 +572,78 @@ async def create_user_bot_handlers(bot_data: Dict):
         user_vars.setdefault("user_user", message.from_user.username or "")
 
         # Получаем стартовую сцену
-        scene = await get_scene(bot_data['id'], bot_data['start_scene'])
+        scene = await get_scene_by_scene_id(bot_data['id'], bot_data['start_scene'])
         if not scene:
             await message.answer("Сцена 'start' не найдена.")
             return
 
         # Получаем сообщения сцены
-        async with db_conn.execute(
-            "SELECT id, text FROM messages WHERE scene_id = ? ORDER BY message_order",
-            (scene['id'],)
-        ) as cursor:
-            messages = await cursor.fetchall()
+        messages = await get_messages(scene['id'])
 
-        for msg_id, msg_text in messages:
-            processed = vm.replace_placeholders(msg_text, user_vars)
+        for msg in messages:
+            processed = vm.replace_placeholders(msg['text'], user_vars)
 
             # Получаем кнопки для этого сообщения
-            async with db_conn.execute(
-                "SELECT text, action FROM buttons WHERE message_id = ? ORDER BY button_order",
-                (msg_id,)
-            ) as cursor:
-                buttons = await cursor.fetchall()
+            buttons = await get_buttons(msg['id'])
 
             keyboard = None
             if buttons:
                 kb_buttons = []
-                for btn_text, btn_action in buttons:
-                    kb_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=btn_text)])
+                for btn in buttons:
+                    kb_buttons.append([InlineKeyboardButton(text=btn['text'], callback_data=f"btn_{btn['id']}")])
                 keyboard = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
 
             await message.answer(processed, reply_markup=keyboard)
 
-    @router.callback_query()
+    @router.callback_query(F.data.startswith("btn_"))
     async def user_bot_callback(callback: CallbackQuery):
+        btn_id = int(callback.data.split("_")[1])
         db_conn = await get_db()
-        vm = VariableManager(db_conn, bot_data['id'])
-        await vm.load_aliases()
-
-        # Получаем действие по тексту кнопки
-        async with db_conn.execute(
-            "SELECT action FROM buttons WHERE text = ? AND message_id IN (SELECT id FROM messages WHERE scene_id IN (SELECT id FROM scenes WHERE bot_id = ?))",
-            (callback.data, bot_data['id'])
-        ) as cursor:
+        async with db_conn.execute("SELECT action FROM buttons WHERE id = ?", (btn_id,)) as cursor:
             row = await cursor.fetchone()
             if not row:
                 await callback.answer("❌ Действие не найдено")
                 return
-
         action = row[0]
+
+        db_conn = await get_db()
+        vm = VariableManager(db_conn, bot_data['id'])
+        await vm.load_aliases()
+
         actions = action.split(';')
         for act in actions:
             act = act.strip()
             if act.startswith('goto:'):
                 scene_id = act.replace('goto:', '').strip()
-                # Здесь нужно реализовать показ сцены (можно вызвать функцию показа сцены)
-                # Для простоты отправим сообщение о переходе
-                await callback.message.answer(f"Переход на сцену {scene_id} (заглушка)")
+                # Показываем сцену
+                scene = await get_scene_by_scene_id(bot_data['id'], scene_id)
+                if not scene:
+                    await callback.message.answer(f"❌ Сцена '{scene_id}' не найдена")
+                    continue
+
+                # Получаем переменные пользователя
+                user_vars = {}
+                async with db_conn.execute(
+                    "SELECT key, value FROM user_data WHERE bot_id = ? AND user_id = ?",
+                    (bot_data['id'], callback.from_user.id)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    user_vars = {row[0]: row[1] for row in rows}
+                user_vars.setdefault("name_user", callback.from_user.first_name)
+                user_vars.setdefault("ID_user", str(callback.from_user.id))
+                user_vars.setdefault("user_user", callback.from_user.username or "")
+
+                messages = await get_messages(scene['id'])
+                for msg in messages:
+                    processed = vm.replace_placeholders(msg['text'], user_vars)
+                    btns = await get_buttons(msg['id'])
+                    keyboard = None
+                    if btns:
+                        kb_buttons = []
+                        for b in btns:
+                            kb_buttons.append([InlineKeyboardButton(text=b['text'], callback_data=f"btn_{b['id']}")])
+                        keyboard = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+                    await callback.message.answer(processed, reply_markup=keyboard)
             else:
                 success, msg = await vm.process_expression(callback.from_user.id, act)
                 if not success:
@@ -512,6 +717,7 @@ def get_back_keyboard():
 def get_bot_management_keyboard(bot_id: int):
     keyboard = [
         [InlineKeyboardButton(text="📝 Создать сцену", callback_data=f"create_scene_{bot_id}")],
+        [InlineKeyboardButton(text="📂 Шаблоны сцен", callback_data=f"templates_{bot_id}")],
         [InlineKeyboardButton(text="✏️ Редактировать сцены", callback_data=f"edit_scenes_{bot_id}")],
         [InlineKeyboardButton(text="🔧 Мои переменные", callback_data=f"my_variables_{bot_id}")],
         [InlineKeyboardButton(text="➕ Создать переменную", callback_data=f"create_var_{bot_id}")],
@@ -520,6 +726,16 @@ def get_bot_management_keyboard(bot_id: int):
         [InlineKeyboardButton(text="⏹ Остановить бота", callback_data=f"stop_bot_{bot_id}")],
         [InlineKeyboardButton(text="📊 Статус", callback_data=f"status_bot_{bot_id}")],
         [InlineKeyboardButton(text="↩️ Назад к ботам", callback_data="my_bots")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_scene_management_keyboard(scene_db_id: int, bot_id: int):
+    keyboard = [
+        [InlineKeyboardButton(text="➕ Добавить сообщение", callback_data=f"add_msg_{scene_db_id}")],
+        [InlineKeyboardButton(text="🔘 Добавить кнопку", callback_data=f"add_btn_choose_msg_{scene_db_id}")],
+        [InlineKeyboardButton(text="👁 Просмотреть сцену", callback_data=f"view_scene_{scene_db_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить элементы", callback_data=f"del_elements_{scene_db_id}")],
+        [InlineKeyboardButton(text="↩️ Назад к сценам", callback_data=f"edit_scenes_{bot_id}")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -631,6 +847,44 @@ async def select_bot_callback(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+# ----- Шаблоны -----
+@router.callback_query(F.data.startswith("templates_"))
+async def templates_list(callback: CallbackQuery, state: FSMContext):
+    bot_id = int(callback.data.split("_")[1])
+    templates = await get_templates()
+    if not templates:
+        await callback.answer("Нет доступных шаблонов", show_alert=True)
+        return
+
+    text = "📂 Выберите шаблон для применения:\n\n"
+    keyboard = []
+    for t in templates:
+        text += f"• {t['name']}: {t['description']}\n"
+        keyboard.append([InlineKeyboardButton(
+            text=t['name'],
+            callback_data=f"apply_template_{bot_id}_{t['id']}"
+        )])
+    keyboard.append([InlineKeyboardButton(text="↩️ Назад", callback_data=f"select_bot_{bot_id}")])
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("apply_template_"))
+async def apply_template_callback(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    bot_id = int(parts[2])
+    template_id = int(parts[3])
+    await apply_template(bot_id, template_id)
+    await callback.answer("✅ Шаблон применён!", show_alert=True)
+    # Возвращаемся к управлению ботом
+    bot_data = await get_bot_by_id(bot_id)
+    await callback.message.edit_text(
+        f"Управление ботом @{bot_data['bot_username']}\n"
+        "Шаблон успешно добавлен.",
+        reply_markup=get_bot_management_keyboard(bot_id)
+    )
+
+# ----- Создание сцены -----
 @router.callback_query(F.data.startswith("create_scene_"))
 async def create_scene_start(callback: CallbackQuery, state: FSMContext):
     bot_id = int(callback.data.split("_")[2])
@@ -669,6 +923,7 @@ async def create_scene_finish(message: Message, state: FSMContext):
         reply_markup=get_bot_management_keyboard(bot_id)
     )
 
+# ----- Редактирование сцен (список) -----
 @router.callback_query(F.data.startswith("edit_scenes_"))
 async def edit_scenes_list(callback: CallbackQuery, state: FSMContext):
     bot_id = int(callback.data.split("_")[2])
@@ -676,9 +931,10 @@ async def edit_scenes_list(callback: CallbackQuery, state: FSMContext):
 
     if not scenes:
         await callback.message.edit_text(
-            "У этого бота пока нет сцен. Создайте новую сцену.",
+            "У этого бота пока нет сцен. Создайте новую сцену или примените шаблон.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📝 Создать сцену", callback_data=f"create_scene_{bot_id}")],
+                [InlineKeyboardButton(text="📂 Шаблоны", callback_data=f"templates_{bot_id}")],
                 [InlineKeyboardButton(text="↩️ Назад", callback_data=f"select_bot_{bot_id}")]
             ])
         )
@@ -698,15 +954,332 @@ async def edit_scenes_list(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
 
+# ----- Управление конкретной сценой -----
 @router.callback_query(F.data.startswith("edit_scene_"))
 async def edit_scene_options(callback: CallbackQuery, state: FSMContext):
     scene_db_id = int(callback.data.split("_")[2])
-    # Здесь можно показать опции для сцены (добавить сообщение, кнопку, удалить элементы)
-    # Для краткости опустим детальную реализацию (она аналогична предыдущим ответам)
-    await callback.answer("Редактирование сцены (в разработке)", show_alert=True)
+    scene = await get_scene_by_db_id(scene_db_id)
+    if not scene:
+        await callback.answer("Сцена не найдена")
+        return
+    await state.update_data(current_scene_id=scene_db_id, current_bot_id=scene['bot_id'])
+    await callback.message.edit_text(
+        f"Редактирование сцены: {scene['name']} (ID: {scene['scene_id']})",
+        reply_markup=get_scene_management_keyboard(scene_db_id, scene['bot_id'])
+    )
+    await callback.answer()
 
-# Аналогично для других кнопок (переменные, алиасы, запуск/остановка)
+# ----- Добавление сообщения -----
+@router.callback_query(F.data.startswith("add_msg_"))
+async def add_msg_start(callback: CallbackQuery, state: FSMContext):
+    scene_db_id = int(callback.data.split("_")[2])
+    await state.update_data(current_scene_id=scene_db_id)
+    await state.set_state(ConstructorStates.add_message)
+    await callback.message.edit_text(
+        "➕ Добавление сообщения\n\n"
+        "Введите текст сообщения (можно использовать ##переменные##):",
+        reply_markup=get_back_keyboard()
+    )
+    await callback.answer()
 
+@router.message(ConstructorStates.add_message)
+async def add_msg_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+    scene_db_id = data.get("current_scene_id")
+    text = message.text
+
+    msg_id = await add_message(scene_db_id, text)
+    await state.clear()
+    scene = await get_scene_by_db_id(scene_db_id)
+    await message.answer(
+        f"✅ Сообщение добавлено.",
+        reply_markup=get_scene_management_keyboard(scene_db_id, scene['bot_id'])
+    )
+
+# ----- Добавление кнопки (выбор сообщения) -----
+@router.callback_query(F.data.startswith("add_btn_choose_msg_"))
+async def add_btn_choose_msg(callback: CallbackQuery, state: FSMContext):
+    scene_db_id = int(callback.data.split("_")[3])
+    messages = await get_messages(scene_db_id)
+    if not messages:
+        await callback.answer("❌ Сначала добавьте сообщение", show_alert=True)
+        return
+
+    await state.update_data(current_scene_id=scene_db_id)
+    text = "Выберите сообщение, к которому добавить кнопку:\n\n"
+    keyboard = []
+    for msg in messages:
+        preview = msg['text'][:30] + "..." if len(msg['text']) > 30 else msg['text']
+        keyboard.append([InlineKeyboardButton(
+            text=f"📝 {preview}",
+            callback_data=f"add_btn_to_msg_{msg['id']}"
+        )])
+    keyboard.append([InlineKeyboardButton(text="↩️ Назад", callback_data=f"edit_scene_{scene_db_id}")])
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("add_btn_to_msg_"))
+async def add_btn_start(callback: CallbackQuery, state: FSMContext):
+    msg_id = int(callback.data.split("_")[3])
+    await state.update_data(current_message_id=msg_id)
+    await state.set_state(ConstructorStates.add_button)
+    await callback.message.edit_text(
+        "➕ Добавление кнопки\n\n"
+        "Введите данные в формате: Текст кнопки | Действие\n\n"
+        "Примеры действий:\n"
+        "goto:start\n"
+        "stars == 10\n"
+        "stars ++ 5\n"
+        "rank -- 1\n"
+        "Можно комбинировать через ; (например: stars ++ 5;goto:menu)",
+        reply_markup=get_back_keyboard()
+    )
+    await callback.answer()
+
+@router.message(ConstructorStates.add_button)
+async def add_btn_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+    msg_id = data.get("current_message_id")
+    scene_db_id = data.get("current_scene_id")
+
+    if "|" not in message.text:
+        await message.answer("❌ Используйте формат: Текст | Действие")
+        return
+
+    btn_text, btn_action = message.text.split("|", 1)
+    btn_text = btn_text.strip()
+    btn_action = btn_action.strip()
+
+    await add_button(scene_db_id, msg_id, btn_text, btn_action)
+    await state.clear()
+    scene = await get_scene_by_db_id(scene_db_id)
+    await message.answer(
+        f"✅ Кнопка добавлена.",
+        reply_markup=get_scene_management_keyboard(scene_db_id, scene['bot_id'])
+    )
+
+# ----- Просмотр сцены с подстановкой -----
+@router.callback_query(F.data.startswith("view_scene_"))
+async def view_scene_callback(callback: CallbackQuery):
+    scene_db_id = int(callback.data.split("_")[2])
+    scene = await get_scene_by_db_id(scene_db_id)
+    if not scene:
+        await callback.answer("Сцена не найдена")
+        return
+
+    db_conn = await get_db()
+    vm = VariableManager(db_conn, scene['bot_id'])
+    await vm.load_aliases()
+
+    # Получаем переменные пользователя (для примера используем текущего пользователя)
+    user_vars = {}
+    async with db_conn.execute(
+        "SELECT key, value FROM user_data WHERE bot_id = ? AND user_id = ?",
+        (scene['bot_id'], callback.from_user.id)
+    ) as cursor:
+        rows = await cursor.fetchall()
+        user_vars = {row[0]: row[1] for row in rows}
+    user_vars.setdefault("name_user", callback.from_user.first_name)
+    user_vars.setdefault("ID_user", str(callback.from_user.id))
+    user_vars.setdefault("user_user", callback.from_user.username or "")
+
+    messages = await get_messages(scene_db_id)
+    if not messages:
+        await callback.message.edit_text(
+            "Сцена не содержит сообщений.",
+            reply_markup=get_scene_management_keyboard(scene_db_id, scene['bot_id'])
+        )
+        await callback.answer()
+        return
+
+    text = f"👁 Просмотр сцены: {scene['name']} (ID: {scene['scene_id']})\n\n"
+    for msg in messages:
+        processed = vm.replace_placeholders(msg['text'], user_vars)
+        text += f"📝 Сообщение {msg['message_order']}:\n{processed}\n\n"
+        buttons = await get_buttons(msg['id'])
+        if buttons:
+            text += "Кнопки:\n"
+            for btn in buttons:
+                text += f"• {btn['text']} → {btn['action']}\n"
+            text += "\n"
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=get_scene_management_keyboard(scene_db_id, scene['bot_id'])
+    )
+    await callback.answer()
+
+# ----- Удаление элементов -----
+@router.callback_query(F.data.startswith("del_elements_"))
+async def del_elements_start(callback: CallbackQuery, state: FSMContext):
+    scene_db_id = int(callback.data.split("_")[2])
+    scene = await get_scene_by_db_id(scene_db_id)
+    if not scene:
+        await callback.answer("Сцена не найдена")
+        return
+
+    messages = await get_messages(scene_db_id)
+    if not messages:
+        await callback.answer("Сцена пуста, нечего удалять", show_alert=True)
+        return
+
+    await state.update_data(current_scene_id=scene_db_id)
+    text = "🗑 Выберите элемент для удаления:\n\n"
+    keyboard = []
+
+    for msg in messages:
+        preview = msg['text'][:20] + "..." if len(msg['text']) > 20 else msg['text']
+        keyboard.append([InlineKeyboardButton(
+            text=f"🗑 Сообщение {msg['message_order']}: {preview}",
+            callback_data=f"del_msg_{msg['id']}"
+        )])
+        # Кнопки этого сообщения
+        btns = await get_buttons(msg['id'])
+        for btn in btns:
+            keyboard.append([InlineKeyboardButton(
+                text=f"  🗑 Кнопка: {btn['text']}",
+                callback_data=f"del_btn_{btn['id']}"
+            )])
+
+    keyboard.append([InlineKeyboardButton(text="↩️ Назад", callback_data=f"edit_scene_{scene_db_id}")])
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("del_msg_"))
+async def del_msg_callback(callback: CallbackQuery, state: FSMContext):
+    msg_id = int(callback.data.split("_")[2])
+    await delete_message(msg_id)
+    await callback.answer("✅ Сообщение удалено", show_alert=True)
+    # Возвращаемся к списку удаления
+    data = await state.get_data()
+    scene_db_id = data.get("current_scene_id")
+    await del_elements_start(callback, state)
+
+@router.callback_query(F.data.startswith("del_btn_"))
+async def del_btn_callback(callback: CallbackQuery, state: FSMContext):
+    btn_id = int(callback.data.split("_")[2])
+    await delete_button(btn_id)
+    await callback.answer("✅ Кнопка удалена", show_alert=True)
+    data = await state.get_data()
+    scene_db_id = data.get("current_scene_id")
+    await del_elements_start(callback, state)
+
+# ----- Переменные и алиасы -----
+@router.callback_query(F.data.startswith("my_variables_"))
+async def my_variables_callback(callback: CallbackQuery):
+    bot_id = int(callback.data.split("_")[2])
+    db_conn = await get_db()
+    vm = VariableManager(db_conn, bot_id)
+    await vm.load_aliases()
+
+    # Получаем переменные текущего пользователя для этого бота
+    async with db_conn.execute(
+        "SELECT key, value FROM user_data WHERE bot_id = ? AND user_id = ?",
+        (bot_id, callback.from_user.id)
+    ) as cursor:
+        rows = await cursor.fetchall()
+        user_vars = {row[0]: row[1] for row in rows}
+
+    text = "🔧 Ваши переменные:\n\n"
+    if user_vars:
+        for k, v in user_vars.items():
+            text += f"##{k}## = {v}\n"
+    else:
+        text += "У вас пока нет переменных.\n"
+
+    if vm.aliases:
+        text += "\nАлиасы:\n"
+        for alias, val in vm.aliases.items():
+            text += f"{alias} = {val}\n"
+
+    keyboard = [
+        [InlineKeyboardButton(text="➕ Создать переменную", callback_data=f"create_var_{bot_id}")],
+        [InlineKeyboardButton(text="➕ Добавить алиас", callback_data=f"add_alias_{bot_id}")],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data=f"select_bot_{bot_id}")]
+    ]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("create_var_"))
+async def create_var_start(callback: CallbackQuery, state: FSMContext):
+    bot_id = int(callback.data.split("_")[2])
+    await state.update_data(current_bot_id=bot_id)
+    await state.set_state(ConstructorStates.create_variable)
+    await callback.message.edit_text(
+        "➕ Создание переменной\n\n"
+        "Введите выражение в формате: имя == значение\n"
+        "Например: stars == 10  или  rank == Veteran",
+        reply_markup=get_back_keyboard()
+    )
+    await callback.answer()
+
+@router.message(ConstructorStates.create_variable)
+async def create_var_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+    bot_id = data.get("current_bot_id")
+    expr = message.text
+
+    db_conn = await get_db()
+    vm = VariableManager(db_conn, bot_id)
+    await vm.load_aliases()
+
+    success, result = await vm.process_expression(message.from_user.id, expr)
+    if success:
+        await message.answer(
+            result,
+            reply_markup=get_bot_management_keyboard(bot_id)
+        )
+    else:
+        await message.answer(
+            result,
+            reply_markup=get_back_keyboard()
+        )
+    await state.clear()
+
+@router.callback_query(F.data.startswith("add_alias_"))
+async def add_alias_start(callback: CallbackQuery, state: FSMContext):
+    bot_id = int(callback.data.split("_")[2])
+    await state.update_data(current_bot_id=bot_id)
+    await state.set_state(ConstructorStates.add_alias)
+    await callback.message.edit_text(
+        "➕ Добавление алиаса\n\n"
+        "Введите в формате: алиас == число\n"
+        "Например: Veteran == 2",
+        reply_markup=get_back_keyboard()
+    )
+    await callback.answer()
+
+@router.message(ConstructorStates.add_alias)
+async def add_alias_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+    bot_id = data.get("current_bot_id")
+    expr = message.text
+
+    if "==" not in expr:
+        await message.answer("❌ Используйте формат: алиас == число")
+        return
+
+    alias, val_str = expr.split("==", 1)
+    alias = alias.strip()
+    try:
+        value = int(val_str.strip())
+    except:
+        await message.answer("❌ Число должно быть целым")
+        return
+
+    db_conn = await get_db()
+    vm = VariableManager(db_conn, bot_id)
+    await vm.save_alias(alias, value)
+
+    await message.answer(
+        f"✅ Алиас '{alias}' = {value} сохранён.",
+        reply_markup=get_bot_management_keyboard(bot_id)
+    )
+    await state.clear()
+
+# ----- Запуск/остановка бота -----
 @router.callback_query(F.data.startswith("start_bot_"))
 async def start_bot_callback(callback: CallbackQuery):
     bot_id = int(callback.data.split("_")[2])
@@ -745,6 +1318,33 @@ async def stop_bot_callback(callback: CallbackQuery):
     else:
         await callback.answer("❌ Бот не был запущен", show_alert=True)
 
+@router.callback_query(F.data.startswith("status_bot_"))
+async def status_bot_callback(callback: CallbackQuery):
+    bot_id = int(callback.data.split("_")[2])
+    bot_data = await get_bot_by_id(bot_id)
+    if not bot_data:
+        await callback.answer("Бот не найден")
+        return
+
+    is_running = bot_data['token'] in user_bots
+    scenes = await get_bot_scenes(bot_id)
+    text = f"📊 Статус бота @{bot_data['bot_username']}\n\n"
+    text += f"• Статус: {'🟢 Запущен' if is_running else '🔴 Остановлен'}\n"
+    text += f"• Сцен: {len(scenes)}\n"
+    if scenes:
+        text += "\nСцены:\n"
+        for s in scenes:
+            msgs = await get_messages(s['id'])
+            btns = 0
+            for m in msgs:
+                btns += len(await get_buttons(m['id']))
+            text += f"• {s['scene_id']} ({len(msgs)} сообщ., {btns} кнопок)\n"
+
+    keyboard = [[InlineKeyboardButton(text="↩️ Назад", callback_data=f"select_bot_{bot_id}")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.answer()
+
+# ----- Помощь -----
 @router.callback_query(F.data == "help")
 async def help_callback(callback: CallbackQuery):
     help_text = """
@@ -759,6 +1359,10 @@ async def help_callback(callback: CallbackQuery):
 • Сцена — это набор сообщений и кнопок.
 • Сообщения отправляются последовательно.
 • Кнопки можно добавлять к любому сообщению.
+
+**Шаблоны**
+• Готовые наборы сцен для быстрого старта.
+• Выберите "Шаблоны сцен" в меню бота.
 
 **Переменные**
 • Системные: `##name_user##`, `##ID_user##`, `##user_user##`.
@@ -775,7 +1379,9 @@ async def help_callback(callback: CallbackQuery):
 • Позволяют тексту соответствовать числу (например, Veteran = 2).
 • Добавляются через "➕ Добавить алиас".
 
-Подробнее — в разделах помощи по каждой функции.
+**Редактирование**
+• В сцене можно добавлять/удалять сообщения и кнопки.
+• Используйте кнопки управления сценой.
 """
     keyboard = [[InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_main")]]
     await callback.message.edit_text(help_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
@@ -805,7 +1411,7 @@ async def web_server():
 # ========== MAIN ==========
 async def main():
     await get_db()
-    await start_all_user_bots()  # Запускаем всех активных ботов при старте
+    await start_all_user_bots()
 
     asyncio.create_task(web_server())
     await asyncio.sleep(1)
